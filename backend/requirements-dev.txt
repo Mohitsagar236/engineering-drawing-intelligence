@@ -3,3 +3,5 @@ httpx==0.28.1
 pytest==9.2.0
 pip-audit==2.10.1
 ruff==0.14.3
+pip==26.3
+setuptools==84.2.1
