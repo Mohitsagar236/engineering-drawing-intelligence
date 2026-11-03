@@ -7,7 +7,7 @@ services:
       - ./backend/.env
     volumes:
       - ed_uploads:/app/uploads
-      - ed_data:/app
+      - ed_data:/app/data
   frontend:
     image: node:20-alpine
     working_dir: /frontend
