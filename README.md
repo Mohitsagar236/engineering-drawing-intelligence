@@ -18,6 +18,9 @@ The application turns uploaded plans, elevations, specifications, and scanned dr
 - Safety-aware asbestos classifications
 - Downloadable analysis reports
 - Next.js upload and workspace dashboard
+- Docker Compose development environment
+- Cached OCR model instances to avoid loading a model per page/request
+- Configurable CORS, upload limits, and environment-based deployment settings
 
 ## Architecture
 
@@ -68,6 +71,13 @@ npm run dev
 ```
 
 Open `http://localhost:3000`.
+
+### Docker Compose
+
+```bash
+cp backend/.env.example backend/.env
+docker compose up --build
+```
 
 ## API quick reference
 

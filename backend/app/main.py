@@ -1,4 +1,4 @@
-import json, os, shutil
+import json, os
 from pathlib import Path
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +14,7 @@ from app.services.ocr import pages_for_file, recognize
 Base.metadata.create_all(engine)
 os.makedirs(settings.upload_dir, exist_ok=True)
 app = FastAPI(title="Engineering Drawing Intelligence", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"])
 
 @app.on_event("startup")
 def startup():
@@ -29,7 +29,18 @@ async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
     ext = Path(file.filename or "").suffix.lower()
     if ext not in {".pdf", ".png", ".jpg", ".jpeg"}: raise HTTPException(400, "Supported formats: PDF, PNG, JPG, JPEG")
     target = Path(settings.upload_dir) / f"{os.urandom(8).hex()}{ext}"
-    with target.open("wb") as output: shutil.copyfileobj(file.file, output)
+    max_bytes = settings.max_upload_mb * 1024 * 1024
+    total = 0
+    try:
+        with target.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(413, f"File exceeds {settings.max_upload_mb} MB limit")
+                output.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
     document = Document(filename=file.filename, content_type=file.content_type or "application/octet-stream", status="PROCESSING")
     db.add(document); db.commit(); db.refresh(document)
     try:
@@ -39,7 +50,8 @@ async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
                 normalized, classification, score = match(db, text)
                 db.add(Finding(document_id=document.id, page=index, source_text=text, normalized_name=normalized, classification=classification, confidence=min(confidence, score), bbox=json.dumps(bbox), engine=settings.ocr_engine))
         document.status = "COMPLETE"
-    except Exception: document.status = "FAILED"
+    except Exception:
+        document.status = "FAILED"
     db.commit(); db.refresh(document)
     return document
 

@@ -11,7 +11,7 @@ SEED = [
 def seed(db: Session):
     if db.query(Material).count(): return
     for name, aliases, category, status in SEED:
-        db.add(Material(standard_name=name, aliases=aliases, category=category, asbestos_status=status))
+        db.add(Material(standard_name=name, aliases=aliases, category=category, asbestos_status=status, verification_status="VERIFIED"))
     db.commit()
 
 def normalize(text: str) -> str:
@@ -25,7 +25,7 @@ def match(db: Session, text: str):
             current = fuzz.token_set_ratio(candidate, normalize(alias))
             if current > score: best, score = material, current
     # Safety invariant: only explicit verified statuses can leave manual review.
-    if not best or score < 86 or best.asbestos_status in ("UNKNOWN", "CONDITION_DEPENDENT"):
+    if not best or score < 86 or best.verification_status != "VERIFIED" or best.asbestos_status in ("UNKNOWN", "CONDITION_DEPENDENT"):
         return (text, "MANUAL_REVIEW", score / 100)
     classification = "ASBESTOS_CONTAINING" if best.asbestos_status == "CONTAINS_ASBESTOS" else "NON_ASBESTOS"
     return (best.standard_name, classification, score / 100)

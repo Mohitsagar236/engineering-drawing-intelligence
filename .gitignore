@@ -1,0 +1,9 @@
+.DS_Store
+.env
+backend/.venv/
+backend/ed.db
+backend/uploads/
+frontend/node_modules/
+frontend/.next/
+__pycache__/
+*.pyc

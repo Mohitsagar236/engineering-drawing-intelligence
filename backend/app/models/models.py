@@ -35,3 +35,4 @@ class Material(Base):
     asbestos_status: Mapped[str] = mapped_column(String(40), default="UNKNOWN")
     conditions: Mapped[str] = mapped_column(Text, default="")
     source: Mapped[str] = mapped_column(Text, default="Local reference; verify before use")
+    verification_status: Mapped[str] = mapped_column(String(40), default="UNVERIFIED")
