@@ -1,0 +1,4 @@
+# Install on Python 3.11. CPU models are downloaded on first use.
+-r requirements-easyocr.txt
+paddleocr==3.7.0
+paddlepaddle==3.3.1

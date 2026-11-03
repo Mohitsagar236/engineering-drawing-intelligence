@@ -1,128 +1,189 @@
 # Engineering Drawing Intelligence
 
-AI-assisted OCR and material-risk review for architectural and structural engineering drawings.
+[![Validate](https://github.com/Mohitsagar236/engineering-drawing-intelligence/actions/workflows/ci.yml/badge.svg)](https://github.com/Mohitsagar236/engineering-drawing-intelligence/actions/workflows/ci.yml)
 
-The application turns uploaded plans, elevations, specifications, and scanned drawings into traceable material findings. Each finding retains its source text, page number, OCR confidence, engine, and bounding-box coordinates for review against the original drawing.
+**From engineering drawings to traceable material evidence.**
 
-> **Safety first:** OCR uncertainty and database mismatches are never treated as proof of non-asbestos. Unless a verified reference record supports the decision, the result remains `MANUAL_REVIEW`.
+A working application for OCR, material reference matching, and asbestos review. Upload a PDF or scanned drawing, inspect extracted annotations on the original page, compare OCR engines, and record review decisions with supporting sources.
 
-## Current capabilities
+![Drawing intelligence dashboard](docs/images/dashboard.png)
 
-- Upload PDF, PNG, JPG, and JPEG drawings
-- Render PDF pages for page-level processing
-- OpenCV preprocessing foundation for scanned drawings
-- Pluggable PaddleOCR and EasyOCR adapters
-- Preserve OCR confidence, engine, page, and bounding-box data
-- Normalize material names and match them against a reference catalog
-- SQLite persistence through SQLAlchemy
-- Safety-aware asbestos classifications
-- Downloadable analysis reports
-- Next.js upload and workspace dashboard
-- Docker Compose development environment
-- Cached OCR model instances to avoid loading a model per page/request
-- Configurable CORS, upload limits, and environment-based deployment settings
+## What you can do
+
+- **Analyze drawings:** PDF, PNG, JPG, and JPEG uploads with progress, content validation, page limits, and bounded rendering.
+- **Run real OCR:** EasyOCR and PaddleOCR on CPU, with English recognition and configurable Japanese model settings.
+- **Inspect the evidence:** page navigation, zoom, clickable OCR polygons, confidence, source annotations, match scores, and reference snapshots.
+- **Compare engines:** retain separate analysis runs and inspect each engine's output side by side.
+- **Manage references:** create, edit, verify, and import/export material catalog records, including manufacturer, conditions, source, and update date.
+- **Review findings:** save a reason and evidence source for each human decision while preserving the original AI result.
+- **Export reports:** downloadable PDF and CSV reports, including historical analysis runs.
+- **Monitor processing:** database-backed dashboard counts, classification distribution, OCR confidence, status, failures, and processing history.
+
+![Drawing viewer with source annotations and review workflow](docs/images/drawing-viewer.png)
+
+## Evidence-based classification
+
+| Result | Required evidence |
+| --- | --- |
+| Asbestos containing | A unique exact match to an explicitly verified positive reference, sufficient OCR confidence, and no unresolved conditions. |
+| Non asbestos | A unique exact match to an explicitly verified negative reference, sufficient OCR confidence, and no unresolved conditions. |
+| Manual review | Low confidence, fuzzy-only matches, conflicting aliases, unknown status, demonstration records, or unresolved conditions. |
+
+Fuzzy similarity suggests candidates; it never establishes asbestos status. Seed records are labeled **DEMONSTRATION** and have **UNKNOWN** status. CSV imports remain **UNVERIFIED** until individually reviewed. Every classification stores its reference snapshot and explanation.
 
 ## Architecture
 
 ```text
-Next.js dashboard → FastAPI REST API → SQLAlchemy / SQLite
-                              ├─ PDF and image extraction
-                              ├─ OpenCV preprocessing
-                              ├─ PaddleOCR / EasyOCR adapters
-                              └─ material normalization and safety matching
+Browser / Next.js
+        │ same-origin API proxy
+        ▼
+FastAPI ───────────── SQLAlchemy / SQLite or PostgreSQL
+        │                    │
+        │ upload             ├── reference catalog
+        └── durable queue    ├── OCR evidence and analysis history
+                │            └── reviews and audit records
+                ▼
+        Single dispatcher
+                │ bounded inference subprocess
+                ▼
+  PyMuPDF → OpenCV → EasyOCR / PaddleOCR
+                │
+                ▼
+  Page images + OCR polygons + material matching
 ```
 
-## Repository layout
+The release targets one authenticated workspace with one dispatcher. Signed browser sessions, login throttling, HTTP Basic API access, upload limits, schema migrations, persistent volumes, and a compiled frontend are included. See the [deployment runbook](docs/DEPLOYMENT.md) for HTTPS, secrets, backups, recovery, and scaling boundaries.
 
-```text
-ED/
-├── backend/app/
-│   ├── core/       # Environment configuration
-│   ├── db/         # Database session
-│   ├── models/     # SQLAlchemy models
-│   ├── schemas/    # Pydantic schemas
-│   └── services/   # OCR and material matching
-├── frontend/app/   # Next.js interface
-└── README.md
-```
+## Quick start
 
-## Run locally
+Requires **Python 3.11** and **Node.js 22**.
 
-### Backend
+### 1. Backend
 
 ```bash
-cd backend
-python3 -m venv .venv
+git clone https://github.com/Mohitsagar236/engineering-drawing-intelligence.git
+cd engineering-drawing-intelligence/backend
+python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt -r requirements-easyocr.txt
+cp .env.example .env
+alembic upgrade head
+PYTHONPATH=. python scripts/provision_models.py --engine easyocr
 uvicorn app.main:app --reload --port 8000
 ```
 
-API: `http://localhost:8000` · Swagger docs: `http://localhost:8000/docs`
+### 2. Processing worker
 
-### Frontend
+In another terminal, use the same environment and working directory:
 
-In a second terminal:
+```bash
+cd backend
+source .venv/bin/activate
+python -m app.worker
+```
+
+### 3. Frontend
 
 ```bash
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
-Open `http://localhost:3000`.
+Open **http://localhost:3000**. API documentation is at **http://localhost:8000/docs**.
+
+Uploads stay queued until the worker is running. OCR weights download during provisioning; preserve the model cache for offline operation.
+
+### PaddleOCR
+
+```bash
+cd backend
+source .venv/bin/activate
+pip install -r requirements-ocr.txt
+PYTHONPATH=. python scripts/provision_models.py --engine paddleocr
+```
+
+Set `OCR_LANGUAGES=ja,en` for EasyOCR Japanese recognition. PaddleOCR requires a single language: `OCR_LANGUAGES=ja` maps to its `japan` model. Japanese accuracy has not been evaluated on field drawings.
 
 ### Docker Compose
 
 ```bash
 cp backend/.env.example backend/.env
-docker compose up --build
+docker compose up --build -d
+docker compose run --rm backend python scripts/provision_models.py --engine easyocr
 ```
 
-## API quick reference
+Compose builds the production frontend, migrates the database, starts the API and worker, and persists uploads, pages, and model weights. The frontend binds to localhost:3000. Enable PaddleOCR with `INSTALL_PADDLE=true` when building. Public deployment requires HTTPS and production authentication settings; see [DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
+## API examples
 
 ```bash
-# Upload a drawing
-curl -X POST http://localhost:8000/api/documents -F "file=@path/to/drawing.pdf"
+# Queue a drawing
+curl -F "file=@drawing.pdf" http://localhost:8000/api/documents/upload
 
-# List analyses
-curl http://localhost:8000/api/documents
+# Inspect status and results
+curl http://localhost:8000/api/documents/1
+curl http://localhost:8000/api/documents/1/results
 
-# Download a report
-curl -OJ http://localhost:8000/api/documents/1/report
+# Download PDF or CSV
+curl -o report.pdf http://localhost:8000/api/documents/1/report
+curl -o findings.csv 'http://localhost:8000/api/documents/1/report?format=csv'
 ```
 
-## Classification behavior
+Authenticated deployments support HTTP Basic for API clients. Interactive docs cover processing, comparison, materials, imports, reviews, audit history, and dashboard endpoints.
 
-| Result | Meaning |
-|---|---|
-| `ASBESTOS_CONTAINING` | A verified reference record explicitly supports asbestos presence. |
-| `NON_ASBESTOS` | A verified reference record explicitly supports non-asbestos status. |
-| `MANUAL_REVIEW` | The match is uncertain, conditional, unknown, or below threshold. |
+## Verification
 
-Condition-dependent materials remain in manual review until the applicable conditions are verified.
+```bash
+cd backend
+PYTHONPATH=. pytest -q tests
+ruff check app tests scripts
+alembic check
+pip-audit
 
-## Configuration
+# Real inference on a reproducible synthetic drawing
+PYTHONPATH=. python scripts/evaluate.py --engine easyocr
+PYTHONPATH=. python scripts/evaluate.py --engine paddleocr
 
-Optional `backend/.env` values:
+# Synthetic rule metrics: precision, recall, F1, confusion matrix
+PYTHONPATH=. python scripts/evaluate_matching.py
 
-```env
-DATABASE_URL=sqlite:///./ed.db
-UPLOAD_DIR=./uploads
-MAX_UPLOAD_MB=50
-OCR_ENGINE=auto
+# Complete live API → worker → OCR → PDF/CSV flow
+python scripts/smoke.py
 ```
 
-SQLite is the default for local development. The SQLAlchemy architecture is compatible with PostgreSQL deployment.
+The browser suite runs against a live stack after the smoke test creates its sample drawing:
 
-## Roadmap
+```bash
+cd frontend
+npm run build
+npx playwright install chromium
+npm run test:e2e
+```
 
-- Store rendered page images and show OCR overlays in the viewer
-- Add asynchronous processing and upload progress events
-- Add configurable preprocessing profiles and OCR comparison
-- Expand the material catalog with source and verification metadata
-- Add PostgreSQL, object storage, Docker Compose, tests, and CI
+Both engines correctly extracted all three annotations in the clean synthetic OCR fixture during local validation (CER 0, WER 0). These results measure that fixture only and are **not field accuracy claims**. Real scanned, rotated, handwritten, and Japanese drawings require a representative evaluation dataset.
 
-## Disclaimer
+## Project structure
 
-This project is an engineering-review aid, not a substitute for certified asbestos surveying, laboratory analysis, regulatory interpretation, or professional approval. Findings must be independently verified before remediation, demolition, procurement, or compliance decisions.
+```text
+backend/
+  app/core/           Configuration, sessions, upload protection
+  app/models/         Documents, jobs, references, evidence, reviews, audit
+  app/services/       Rendering, preprocessing, OCR, matching, PDF reports
+  app/worker.py       Durable dispatcher and isolated inference
+  migrations/         Versioned Alembic schema
+  scripts/            Model provisioning, evaluation, live smoke test
+  tests/              Isolated API, classification, and security tests
+frontend/
+  app/                Dashboard, drawing viewer, reference and review UI
+  tests/              Playwright browser checks
+docs/
+  DEPLOYMENT.md       Deployment and recovery runbook
+docker-compose.yml
+```
+
+## Scope and limitations
+
+The application provides decision support and source traceability. It does not establish the absence of asbestos from a drawing alone. Real reference data must come from documented sources, and decisions require professional verification.
+
+The current deployment model uses one configured reviewer identity and one worker. Per-user accounts, tenant isolation, automatic retention policies, and horizontal inference scaling are future extensions. PostgreSQL configuration is supported; the local end-to-end validation uses SQLite.

@@ -1,0 +1,60 @@
+name: Validate
+on: [push, pull_request]
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - run: pip install -r backend/requirements-dev.txt
+      - run: python -m pytest -q tests
+        working-directory: backend
+        env:
+          PYTHONPATH: .
+      - run: alembic upgrade head && alembic check
+        working-directory: backend
+      - run: ruff check app tests scripts && pip-audit
+        working-directory: backend
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci && npm run build
+        working-directory: frontend
+      - run: npm audit --audit-level=high
+        working-directory: frontend
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp backend/.env.example backend/.env && docker compose config --quiet
+      - run: docker compose build
+      - run: docker compose up -d --wait --wait-timeout 120
+      - run: docker compose exec -T backend python scripts/provision_models.py --engine easyocr
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install httpx==0.28.1 PyMuPDF==2.1
+      - run: python backend/scripts/smoke.py --url http://localhost:3000
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci && npx playwright install --with-deps chromium && npm run test:e2e
+        working-directory: frontend
+      - run: docker compose logs backend worker
+        if: always()
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-screenshots
+          path: frontend/test-results
+

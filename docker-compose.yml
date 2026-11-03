@@ -1,23 +1,51 @@
+x-backend: &backend
+  build:
+    context: ./backend
+    args:
+      INSTALL_PADDLE: ${INSTALL_PADDLE:-false}
+  env_file: ./backend/.env
+  environment:
+    DATABASE_URL: sqlite:////app/data/ed.db
+    UPLOAD_DIR: /app/uploads
+  volumes:
+    - ed_data:/app/data
+    - ed_uploads:/app/uploads
+    - ed_models:/home/appuser/.EasyOCR
+    - ed_paddle_models:/home/appuser/.paddlex
+  restart: unless-stopped
+  init: true
 services:
+  migrate:
+    <<: *backend
+    command: ["alembic","upgrade","head"]
+    restart: "no"
   backend:
-    build: ./backend
-    ports:
-      - "8000:8000"
-    env_file:
-      - ./backend/.env
-    volumes:
-      - ed_uploads:/app/uploads
-      - ed_data:/app/data
-  frontend:
-    image: node:20-alpine
-    working_dir: /frontend
-    command: sh -c "npm install && npm run dev"
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./frontend:/frontend
+    <<: *backend
     depends_on:
-      - backend
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD","python","-c","import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    expose: ["8000"]
+  worker:
+    <<: *backend
+    command: ["python","-m","app.worker"]
+    depends_on:
+      backend:
+        condition: service_healthy
+  frontend:
+    build: ./frontend
+    ports: ["127.0.0.1:3000:3000"]
+    restart: unless-stopped
+    init: true
+    depends_on:
+      backend:
+        condition: service_healthy
 volumes:
-  ed_uploads:
   ed_data:
+  ed_uploads:
+  ed_models:
+  ed_paddle_models:
