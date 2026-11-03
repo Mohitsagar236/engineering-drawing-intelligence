@@ -33,7 +33,7 @@ jobs:
       - run: npm audit --audit-level=high
         working-directory: frontend
   containers:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - run: cp backend/.env.example backend/.env && docker compose config --quiet
