@@ -4,37 +4,43 @@ This release supports one authenticated review workspace and one dispatcher per 
 
 ## Local development
 
-Use Python 3.11 and Node.js 22. From the repository root:
+Use Python 3.11 and Node.js 22. The supervised native launcher uses a separate
+virtual environment, database, uploads, and model cache under
+`~/.local/share/ed-native`; it does not reuse `backend/.venv` or `backend/ed.db`.
+From the repository root:
 
 ```bash
-python3.11 -m venv backend/.venv
-cd backend
-source .venv/bin/activate
-pip install -r requirements-dev.txt
-pip install -r requirements-easyocr.txt
-cp .env.example .env
-alembic upgrade head
-PYTHONPATH=. python scripts/provision_models.py --engine easyocr
-uvicorn app.main:app --reload
+python3.11 scripts/local.py setup --provision-models
+python3.11 scripts/local.py run
 ```
 
-Start the dispatcher in another terminal using the same environment and working directory:
+Put Node.js 22 and npm on PATH first. On this workstation:
 
 ```bash
-cd backend
-source .venv/bin/activate
-python -m app.worker
+export PATH="$HOME/.local/share/invoicelens-tools/node-v22.23.4-darwin-arm64/bin:$PATH"
+"$HOME/.local/share/uv/python/cpython-3.11.18-macos-aarch64-none/bin/python3.11" scripts/local.py setup --provision-models
+"$HOME/.local/share/uv/python/cpython-3.11.18-macos-aarch64-none/bin/python3.11" scripts/local.py run --api-port 8010 --web-port 3010
 ```
 
-Start the frontend in a third terminal:
+`setup` installs the hash-verified base lock, the pinned EasyOCR profile constrained
+to that lock, and frontend dependencies using `npm ci`. OCR transitive dependencies
+outside the base lock are resolved at install time. `--provision-models` downloads
+weights into the isolated model cache. Use `--state-dir /absolute/path` on both
+commands for a different workspace. `run` checks ports before migrations, starts
+API/worker/frontend, and stops its own child process groups on Ctrl-C or a child
+failure. It refuses occupied ports and a second launcher using the same state.
+It never terminates unrelated processes. Default URLs are http://localhost:3000
+and http://127.0.0.1:8000; choose alternate ports when an existing stack is live.
+Configuration still reads `backend/.env`; database, uploads, model cache, CORS,
+and frontend API target are overridden to the isolated workspace.
 
-```bash
-cd frontend
-npm ci
-npm run dev
-```
-
-Open http://localhost:3000. Requests use a same-origin API proxy; set `API_INTERNAL_URL` before building if the backend is hosted elsewhere. Uploads remain queued until the dispatcher is running.
+For manual development, use a Python 3.11 environment, install
+`requirements.lock` with `--require-hashes`, then install `requirements-dev.txt`
+and `requirements-easyocr.txt` with `-c requirements.lock`. Run migrations before
+starting `uvicorn app.main:app` and `python -m app.worker` in separate terminals.
+Requests use a same-origin frontend proxy; `API_INTERNAL_URL` must be set before
+building if the backend is hosted elsewhere. Uploads remain queued until the
+worker is running.
 
 ## Containers
 
@@ -56,22 +62,77 @@ INSTALL_PADDLE=true docker compose up -d
 docker compose run --rm backend python scripts/provision_models.py --engine paddleocr
 ```
 
+The shared dependency lock keeps NumPy below 2.4 and PyYAML at 6.0.2 for
+PaddleX 3.7 compatibility. Optional OCR installs are constrained to that lock;
+`pip check` verifies the final image dependency graph. Paddle's optional profile
+resolves for Linux x86_64; a local Docker build and genuine Paddle inference have
+not been verified on this workstation. PaddleX also installs an OpenCV contrib
+distribution alongside the application's headless OpenCV; validate the resulting
+`cv2` runtime on the target image before using Paddle in production.
+
 Both engines use CPU by default. The installed PaddleOCR version chooses its default detection and recognition models; model downloads require network access during provisioning. Preserve model volumes and test initialization before operating offline.
 
 ## Private deployment
 
-Set these values in `backend/.env`:
+Use the production override explicitly. Compose requires `AUTH_PASSWORD` and
+`PUBLIC_ORIGIN` before it can render the configuration; application startup also
+validates the password, username, and explicit HTTPS origins. Values in this
+override take precedence over `backend/.env` for migration, API, and worker.
+Keep `backend/.env` present for the base Compose environment file.
 
-```env
-ENVIRONMENT=production
-AUTH_USERNAME=reviewer
-AUTH_PASSWORD=<a randomly generated secret of at least 16 characters>
-CORS_ORIGINS=https://drawings.example.com
+```bash
+# Configure an HTTPS proxy and DNS for this hostname first.
+export PUBLIC_ORIGIN=https://drawings.example.com
+export AUTH_USERNAME=reviewer
+read -r -s -p 'Production password (at least 16 characters): ' AUTH_PASSWORD; echo
+export AUTH_PASSWORD
+docker compose -f docker-compose.yml -f docker-compose.production.yml config --quiet
+docker compose -f docker-compose.yml -f docker-compose.production.yml up --build -d --wait
+docker compose -f docker-compose.yml -f docker-compose.production.yml exec -T backend python scripts/provision_models.py --engine easyocr
+unset AUTH_PASSWORD
 ```
 
-Production startup rejects a missing or short password. The browser presents a sign-in form. Successful login creates an HttpOnly, SameSite=Strict session cookie with an eight-hour lifetime; in production the cookie is Secure and requires HTTPS. Passwords are never stored in browser local storage. Changing the configured password invalidates existing sessions. HTTP Basic remains available for API clients. All authenticated users share the configured reviewer identity.
+The password prompt above uses Bash. For repeat operations, supply the same
+variables through your deployment secret store or a private root `.env` file
+(which Git ignores). Avoid printing the resolved Compose configuration because
+it includes credentials. Use the same two `-f` flags and secrets for subsequent
+production Compose commands. `PUBLIC_ORIGIN` is an origin such as
+`https://drawings.example.com`, without paths or wildcards. A single deployment
+supports one configured reviewer identity and one dispatcher.
 
-Terminate TLS at your existing reverse proxy and forward to 127.0.0.1:3000. Set the proxy request-body limit to at least MAX_UPLOAD_MB plus multipart overhead. Restrict external access to the proxy. Credentials belong in a deployment secret store or private environment file.
+The browser presents a sign-in form. Successful login creates an HttpOnly,
+SameSite=Strict session cookie with an eight-hour lifetime; production cookies
+are Secure and require HTTPS. Password changes invalidate existing sessions.
+HTTP Basic remains available for API clients.
+
+Signing out persists a hash of the revoked session token, so copied cookies
+cannot be replayed after logout or an API restart. Apply migrations before
+starting this version; the latest revision is `a41f8f92c201`.
+
+Terminate TLS at your existing reverse proxy and forward to 127.0.0.1:3000.
+For example, adapt this nginx server block to a hostname and certificate you own:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name drawings.example.com;
+    ssl_certificate /etc/letsencrypt/live/drawings.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/drawings.example.com/privkey.pem;
+    client_max_body_size 55m; # default MAX_UPLOAD_MB=50 plus multipart overhead
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 120s;
+    }
+}
+```
+
+This proxy example does not provision certificates. Increase the request-body
+limit if you raise `MAX_UPLOAD_MB`; restrict public access to the TLS proxy.
+The default Compose file remains a localhost development configuration.
 
 ## Database and schema
 
@@ -94,7 +155,9 @@ A manual review requires a reason and evidence source. Review decisions are appe
 
 ## Recovery, retention, and diagnostics
 
-- API health: GET /api/health validates database access. This is an API liveness check, not proof of worker or model readiness.
+- API health: GET /api/health validates database access. This is an API liveness check.
+- GET /api/ready checks database access and a worker heartbeat less than 15 seconds old. It does not establish model readiness.
+- Compose checks the worker heartbeat file every five seconds, with a 30-second startup grace period. A stale worker is unhealthy; Docker restart policy alone does not restart unhealthy containers.
 - Queue state, failures, and analysis history are visible in the dashboard and document views.
 - Use `docker compose logs -f backend worker` for server and inference failures.
 - Failed or interrupted analyses can be retried using Run analysis; a new job preserves the earlier run.

@@ -10,16 +10,20 @@ class UploadBodyLimit:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if (
-            scope["type"] != "http"
-            or scope.get("method") != "POST"
-            or scope.get("path")
-            not in ("/api/documents", "/api/documents/upload", "/api/materials/import")
+        if scope["type"] != "http" or scope.get("method") not in (
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
         ):
             return await self.app(scope, receive, send)
-        limit = (
-            2 if scope["path"] == "/api/materials/import" else settings.max_upload_mb
-        ) * 1024 * 1024 + 128 * 1024
+        path = scope.get("path", "")
+        if path in ("/api/documents", "/api/documents/upload"):
+            limit = settings.max_upload_mb * 1024 * 1024 + 128 * 1024
+        elif path == "/api/materials/import":
+            limit = 2 * 1024 * 1024 + 128 * 1024
+        else:
+            limit = 16 * 1024 if path == "/api/session" else 64 * 1024
         headers = dict(scope.get("headers", []))
         try:
             length = int(headers.get(b"content-length", b"0"))

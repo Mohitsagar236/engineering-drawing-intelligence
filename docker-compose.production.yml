@@ -1,0 +1,16 @@
+# Use together with docker-compose.yml; requires an existing HTTPS reverse proxy.
+x-production-environment: &production-environment
+  ENVIRONMENT: production
+  AUTH_USERNAME: ${AUTH_USERNAME:-reviewer}
+  AUTH_PASSWORD: ${AUTH_PASSWORD:?Set AUTH_PASSWORD to a secret of at least 16 characters}
+  CORS_ORIGINS: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN to the explicit HTTPS origin, e.g. https://drawings.example.com}
+services:
+  migrate:
+    environment:
+      <<: *production-environment
+  backend:
+    environment:
+      <<: *production-environment
+  worker:
+    environment:
+      <<: *production-environment

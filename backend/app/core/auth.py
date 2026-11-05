@@ -7,7 +7,10 @@ import json
 import secrets
 import time
 from collections import OrderedDict
+from sqlalchemy import delete
 from app.core.config import settings
+from app.db.session import SessionLocal
+from app.models.models import RevokedSession
 
 COOKIE = "ed_session"
 attempts = OrderedDict()
@@ -44,11 +47,30 @@ def session_actor(cookie):
         if not hmac.compare_digest(signature, expected):
             return None
         data = json.loads(base64.urlsafe_b64decode(payload))
-        if data["expires"] < time.time() or data["actor"] != settings.auth_username:
+        if data["expires"] <= time.time() or data["actor"] != settings.auth_username:
             return None
+        with SessionLocal() as db:
+            if db.get(RevokedSession, hashlib.sha256(cookie.encode()).hexdigest()):
+                return None
         return data["actor"]
     except (ValueError, KeyError, TypeError):
         return None
+
+
+def revoke_session(cookie):
+    if not session_actor(cookie):
+        return
+    with SessionLocal() as db:
+        db.execute(
+            delete(RevokedSession).where(RevokedSession.expires_at <= int(time.time()))
+        )
+        db.merge(
+            RevokedSession(
+                token_hash=hashlib.sha256(cookie.encode()).hexdigest(),
+                expires_at=int(time.time()) + 28800,
+            )
+        )
+        db.commit()
 
 
 def throttled(ip):

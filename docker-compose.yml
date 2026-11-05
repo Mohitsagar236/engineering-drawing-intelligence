@@ -33,6 +33,12 @@ services:
   worker:
     <<: *backend
     command: ["python","-m","app.worker"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,time; p=os.path.join(os.environ['UPLOAD_DIR'], '.worker-heartbeat'); age=time.time()-os.stat(p).st_mtime; raise SystemExit(0 if 0 <= age < 15 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
     depends_on:
       backend:
         condition: service_healthy

@@ -6,6 +6,9 @@ from sqlalchemy.orm import Session
 from app.models.models import Material
 from app.core.config import settings
 
+MATCHING_RULES_VERSION = "material-reference-v2"
+FUZZY_MIN_SCORE = 0.85
+
 
 def normalize(text):
     text = unicodedata.normalize("NFKC", text).casefold()
@@ -33,10 +36,10 @@ def seed(db: Session):
     db.commit()
 
 
-def analyze(db, text, ocr_confidence):
+def analyze(db, text, ocr_confidence, records=None):
     value = normalize(text)
     ranked, exact = [], []
-    for record in db.query(Material).all():
+    for record in db.query(Material).all() if records is None else records:
         names = [
             normalize(n)
             for n in [record.standard_name, *record.aliases.split("|")]
@@ -44,26 +47,66 @@ def analyze(db, text, ocr_confidence):
         ]
         if not names:
             continue
-        score = max(fuzz.WRatio(value, name) for name in names) / 100
+        # WRatio boosts substring matches: a single grade such as 'B' can score
+        # 0.9 against 'ACB'. Compare complete identities instead, and never infer
+        # an identity from short/numeric OCR fragments.
+        score = (
+            max(
+                fuzz.ratio(value, name)
+                if value == name
+                or min(len(value.replace(" ", "")), len(name.replace(" ", ""))) >= 4
+                else 0
+                for name in names
+            )
+            / 100
+        )
         ranked.append((record, score))
         if value in names:
             exact.append(record)
     ranked.sort(key=lambda item: item[1], reverse=True)
+    plausible = [
+        (record, score) for record, score in ranked if score >= FUZZY_MIN_SCORE
+    ]
+    fuzzy_eligible = (
+        len(value.replace(" ", "")) >= 4
+        and any(char.isalpha() for char in value)
+        and math.isfinite(ocr_confidence)
+        and 0.5 <= ocr_confidence <= 1
+    )
     best = (
         exact[0]
         if len(exact) == 1
-        else (ranked[0][0] if ranked and ranked[0][1] >= 0.65 else None)
+        else (plausible[0][0] if not exact and fuzzy_eligible and plausible else None)
+    )
+    method = (
+        "exact"
+        if len(exact) == 1
+        else "ambiguous"
+        if exact
+        else "fuzzy"
+        if best
+        else "none"
     )
     result = dict(
-        name=best.standard_name if best else text,
+        # A fuzzy suggestion must not replace the actual extracted annotation.
+        name=best.standard_name if method == "exact" else text,
         classification="MANUAL_REVIEW",
         material_id=best.id if best else None,
-        score=(1 if exact else ranked[0][1] if best else 0),
-        method="exact" if exact else "fuzzy" if best else "none",
-        explanation="No exact, unambiguous verified product reference matches this annotation.",
+        score=(1 if exact else plausible[0][1] if best else 0),
+        method=method,
+        explanation=(
+            "Multiple references share this exact name or alias; identity requires review."
+            if exact and len(exact) > 1
+            else "Possible spelling match only. The suggested reference is not an established material identity."
+            if method == "fuzzy"
+            else "No credible product reference matches this annotation."
+        ),
         snapshot={},
         alternatives=[
-            dict(id=r.id, name=r.standard_name, score=s) for r, s in ranked[:3]
+            dict(id=r.id, name=r.standard_name, score=s)
+            for r, s in (
+                [(r, 1) for r in exact] if exact else plausible if best else []
+            )[:3]
         ],
     )
     if best:
@@ -120,9 +163,14 @@ def match(db, text, ocr_confidence=0):
 def is_material(text, match_result):
     return bool(
         match_result["material_id"]
+        or match_result["method"] == "ambiguous"
         or re.search(
             r"\b(asbestos|cement|board|tile|insulation|wool|plaster|gypsum|roof|pipe|cladding|floor|ceiling|concrete|steel|timber|vinyl|gasket|sealant|coating)\b",
             text,
             re.I,
+        )
+        or re.search(
+            r"石綿|アスベスト|保温材|断熱材|吹付|吹き付|石膏|せっこう|セメント|スレート|ケイカル|けい酸カルシウム|珪酸カルシウム|岩綿|ロックウール|グラスウール|床材|天井材|配管|ガスケット|パッキン",
+            text,
         )
     )

@@ -1,5 +1,8 @@
 # Release validation — 2026-11-03
 
+For the subsequent hardening changes and current validation, see
+[Production review — 2026-11-05](PRODUCTION_REVIEW.md).
+
 This record describes checks actually run during the 0.2.0 implementation.
 
 | Check | Result |

@@ -24,6 +24,7 @@ class ProcessIn(BaseModel):
 
 
 class MaterialIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     standard_name: str = Field(min_length=2, max_length=255)
     aliases: str = Field(default="", max_length=4000)
     category: str = Field(default="Unknown", max_length=100)
@@ -49,14 +50,15 @@ class MaterialIn(BaseModel):
 
 
 class ReviewIn(BaseModel):
-    finding_id: int
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    finding_id: int = Field(gt=0)
     classification: Classification
     reason: str = Field(min_length=10, max_length=4000)
     source: str = Field(min_length=10, max_length=4000)
 
 
 class CompareIn(BaseModel):
-    document_id: int
+    document_id: int = Field(gt=0)
 
 
 class LoginIn(BaseModel):

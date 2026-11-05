@@ -9,3 +9,6 @@ PyMuPDF==2.1
 rapidfuzz==3.14.6
 alembic==1.20.1
 psycopg[binary]==3.3.7
+# Shared runtime bounds required by PaddleX 3.7 (optional PaddleOCR profile).
+numpy<2.4
+PyYAML==6.0.2

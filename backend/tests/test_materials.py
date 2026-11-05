@@ -67,3 +67,74 @@ def test_unverified_record_requires_review(db):
     material.verification_status = "UNVERIFIED"
     db.commit()
     assert analyze(db, "PX100", 1)["classification"] == "MANUAL_REVIEW"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Academic Section",
+        "A+",
+        "A-",
+        "B",
+        "B-",
+        "C",
+        "LOO",
+        "1.00",
+        "2.00",
+        "Physics Lab",
+        "Fluid Mechanics Lab",
+        "ES Project",
+        "AIITIO",
+        "Course Name",
+        "Introduction to Materials Science and Engineering",
+    ],
+)
+def test_unrelated_academic_text_does_not_become_material(db, text):
+    from app.services.materials import is_material
+
+    seed(db)
+    result = analyze(db, text, 0.99)
+    assert result["material_id"] is None
+    assert result["name"] == text
+    assert result["method"] == "none"
+    assert result["alternatives"] == []
+    assert not is_material(text, result)
+
+
+def test_fuzzy_spelling_is_only_a_suggestion_and_preserves_source(db):
+    from app.services.materials import is_material
+
+    seed(db)
+    text = "Vinyl floor ti1e"
+    result = analyze(db, text, 0.99)
+    assert result["name"] == text
+    assert result["method"] == "fuzzy"
+    assert result["snapshot"]["standard_name"] == "Vinyl floor tile"
+    assert result["classification"] == "MANUAL_REVIEW"
+    assert is_material(text, result)
+
+
+def test_very_low_confidence_text_does_not_gain_a_fuzzy_identity(db):
+    seed(db)
+    result = analyze(db, "G1ass woo1 insu1ation", 0.1)
+    assert result["material_id"] is None
+    assert result["name"] == "G1ass woo1 insu1ation"
+
+
+def test_real_abbreviations_still_match_exactly(db):
+    seed(db)
+    for text in ("ACB", "VCT"):
+        result = analyze(db, text, 0.99)
+        assert result["method"] == "exact"
+        assert result["material_id"] is not None
+
+
+def test_conflicting_aliases_do_not_select_an_arbitrary_product(db):
+    reference(db)
+    db.add(Material(standard_name="Another product", aliases="PX100"))
+    db.commit()
+    result = analyze(db, "PX100", 0.99)
+    assert result["method"] == "ambiguous"
+    assert result["material_id"] is None
+    assert result["snapshot"] == {}
+    assert len(result["alternatives"]) == 2

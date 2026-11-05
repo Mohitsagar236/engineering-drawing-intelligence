@@ -115,3 +115,9 @@ class Review(Base):
     reason: Mapped[str] = mapped_column(Text)
     source: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class RevokedSession(Base):
+    __tablename__ = "revoked_sessions"
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    expires_at: Mapped[int] = mapped_column(Integer, index=True)

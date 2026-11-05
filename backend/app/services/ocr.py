@@ -17,7 +17,11 @@ def inspect_file(path):
         import pymupdf as fitz
 
         with fitz.open(path) as doc:
-            if doc.needs_pass or not 1 <= len(doc) <= settings.max_pages:
+            if (
+                not doc.is_pdf
+                or doc.needs_pass
+                or not 1 <= len(doc) <= settings.max_pages
+            ):
                 raise ValueError(
                     "PDF must be unencrypted and within the configured page limit"
                 )
@@ -29,8 +33,9 @@ def inspect_file(path):
                     raise ValueError("PDF page exceeds rendering pixel limit")
             return len(doc)
     with Image.open(path) as image:
+        expected = "PNG" if Path(path).suffix.lower() == ".png" else "JPEG"
         if (
-            image.format not in ("PNG", "JPEG")
+            image.format != expected
             or image.width * image.height > settings.max_image_pixels
         ):
             raise ValueError("Unsupported image content or image exceeds pixel limit")

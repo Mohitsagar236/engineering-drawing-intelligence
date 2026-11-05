@@ -9,8 +9,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
-from sqlalchemy import select, text, update
+from sqlalchemy import select, text, update, func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.core.config import settings
@@ -34,8 +35,9 @@ from app.core.auth import (
     check_password,
     throttled,
     failed_login,
+    revoke_session,
 )
-from app.services.materials import seed
+from app.services.materials import seed, MATCHING_RULES_VERSION
 from app.services.ocr import inspect_file, available_engines
 
 logging.basicConfig(
@@ -82,9 +84,40 @@ app.add_middleware(UploadBodyLimit)
 async def security(request: Request, call_next):
     started = time.perf_counter()
     request_id = secrets.token_hex(8)
+
+    def finish(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Request-ID"] = request_id
+        logger.info(
+            json.dumps(
+                {
+                    "event": "request",
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                }
+            )
+        )
+        return response
+
     request.state.actor = "local-developer"
+    login_request = request.url.path == "/api/session" and request.method == "POST"
+    ip = request.client.host if request.client else "unknown"
+    if login_request and throttled(ip):
+        return finish(
+            JSONResponse(
+                {"detail": "Too many login attempts; wait one minute"},
+                status_code=429,
+                headers={"Retry-After": "60"},
+            )
+        )
     if settings.auth_password and request.url.path not in (
         "/api/health",
+        "/api/ready",
         "/api/session",
     ):
         actor = session_actor(request.cookies.get(COOKIE, ""))
@@ -98,32 +131,47 @@ async def security(request: Request, call_next):
             valid = False
         valid = valid or bool(actor)
         if not valid:
-            return Response(
-                status_code=401,
-                headers={"WWW-Authenticate": 'Basic realm="Drawing Intelligence"'},
+            if request.headers.get("Authorization"):
+                ip = request.client.host if request.client else "unknown"
+                if throttled(ip):
+                    return finish(
+                        JSONResponse(
+                            {"detail": "Too many login attempts; wait one minute"},
+                            status_code=429,
+                            headers={"Retry-After": "60"},
+                        )
+                    )
+                failed_login(ip)
+            return finish(
+                Response(
+                    status_code=401,
+                    headers={"WWW-Authenticate": 'Basic realm="Drawing Intelligence"'},
+                )
             )
         request.state.actor = actor or user
     if request.method in ("POST", "PUT", "DELETE") and request.headers.get("origin"):
         if request.headers["origin"] not in settings.cors_origin_list:
-            return JSONResponse({"detail": "Origin is not permitted"}, status_code=403)
+            return finish(
+                JSONResponse({"detail": "Origin is not permitted"}, status_code=403)
+            )
     response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-Request-ID"] = request_id
-    logger.info(
-        json.dumps(
-            {
-                "event": "request",
-                "request_id": request_id,
-                "method": request.method,
-                "path": request.url.path,
-                "status": response.status_code,
-                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
-            }
-        )
+    if login_request and response.status_code in (400, 401, 413, 422):
+        failed_login(ip)
+    return finish(response)
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, exception: RequestValidationError):
+    # Do not reflect credentials or large rejected inputs in validation responses.
+    return JSONResponse(
+        {
+            "detail": [
+                {key: error[key] for key in ("type", "loc", "msg")}
+                for error in exception.errors()
+            ]
+        },
+        status_code=422,
     )
-    return response
 
 
 @app.exception_handler(IntegrityError)
@@ -178,20 +226,23 @@ def serial_job(job):
 def runtime_snapshot():
     return json.dumps(
         {
-            key: getattr(settings, key)
-            for key in (
-                "ocr_languages",
-                "render_dpi",
-                "ocr_min_confidence",
-                "max_image_pixels",
-                "max_pages",
-            )
+            "matching_rules_version": MATCHING_RULES_VERSION,
+            **{
+                key: getattr(settings, key)
+                for key in (
+                    "ocr_languages",
+                    "render_dpi",
+                    "ocr_min_confidence",
+                    "max_image_pixels",
+                    "max_pages",
+                )
+            },
         }
     )
 
 
-def serial_doc(db, doc):
-    job = latest_job(db, doc.id)
+def serial_doc(db, doc, job=None):
+    job = job or latest_job(db, doc.id)
     return dict(
         id=doc.id,
         filename=doc.filename,
@@ -206,6 +257,31 @@ def serial_doc(db, doc):
 def health(db: Session = Depends(get_db)):
     db.execute(text("SELECT 1"))
     return {"status": "ok", "service": "engineering-drawing-intelligence"}
+
+
+@app.get("/api/ready")
+def ready(db: Session = Depends(get_db)):
+    """Readiness includes the dispatcher, unlike the API liveness endpoint."""
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception:
+        logger.exception("Readiness database check failed")
+        return JSONResponse(
+            {"status": "unavailable", "database": False}, status_code=503
+        )
+    try:
+        heartbeat = Path(settings.upload_dir) / ".worker-heartbeat"
+        worker = 0 <= time.time() - heartbeat.stat().st_mtime < 15
+    except OSError:
+        worker = False
+    return JSONResponse(
+        {
+            "status": "ready" if worker else "unavailable",
+            "database": True,
+            "worker": worker,
+        },
+        status_code=200 if worker else 503,
+    )
 
 
 @app.get("/api/settings")
@@ -236,11 +312,7 @@ def session_status(request: Request):
 
 @app.post("/api/session")
 def login(data: LoginIn, request: Request, response: Response):
-    ip = request.client.host if request.client else "unknown"
-    if throttled(ip):
-        raise HTTPException(429, "Too many login attempts; wait one minute")
     if not settings.auth_password or not check_password(data.username, data.password):
-        failed_login(ip)
         raise HTTPException(401, "Invalid username or password")
     response.set_cookie(
         COOKIE,
@@ -255,7 +327,8 @@ def login(data: LoginIn, request: Request, response: Response):
 
 
 @app.delete("/api/session")
-def logout(response: Response):
+def logout(request: Request, response: Response):
+    revoke_session(request.cookies.get(COOKIE, ""))
     response.delete_cookie(COOKIE, path="/")
     return {"authenticated": False}
 
@@ -326,10 +399,17 @@ async def upload(
 def documents(offset: int = 0, limit: int = 100, db: Session = Depends(get_db)):
     if offset < 0 or not 1 <= limit <= 200:
         raise HTTPException(422, "Invalid pagination")
+    latest = select(func.max(Job.id).label("id")).group_by(Job.document_id).subquery()
     return [
-        serial_doc(db, d)
-        for d in db.scalars(
-            select(Document).order_by(Document.id.desc()).offset(offset).limit(limit)
+        serial_doc(db, document, job)
+        for document, job in db.execute(
+            select(Document, Job)
+            .outerjoin(
+                Job, (Job.document_id == Document.id) & Job.id.in_(select(latest.c.id))
+            )
+            .order_by(Document.id.desc())
+            .offset(offset)
+            .limit(limit)
         )
     ]
 
@@ -359,6 +439,11 @@ def process_document(
         db.rollback()
         raise HTTPException(409, "Analysis is already queued or processing")
     previous = latest_job(db, document_id)
+    if not previous or not Path(previous.path).is_file():
+        db.rollback()
+        raise HTTPException(
+            409, "Original upload is unavailable; upload the drawing again"
+        )
     config = options.model_dump()
     selected = config.pop("engine")
     db.add(
@@ -383,16 +468,16 @@ def results(document_id: int, job_id: int = 0, db: Session = Depends(get_db)):
     if not job or job.document_id != document_id:
         raise HTTPException(404, "Analysis not found")
     output = []
-    for finding, evidence in db.execute(
-        select(Finding, Evidence)
+    latest_reviews = select(func.max(Review.id)).group_by(Review.finding_id)
+    for finding, evidence, review in db.execute(
+        select(Finding, Evidence, Review)
         .join(Evidence, Evidence.finding_id == Finding.id)
-        .where(Evidence.job_id == job.id)
-    ):
-        review = db.scalar(
-            select(Review)
-            .where(Review.finding_id == finding.id)
-            .order_by(Review.id.desc())
+        .outerjoin(
+            Review, (Review.finding_id == Finding.id) & Review.id.in_(latest_reviews)
         )
+        .where(Evidence.job_id == job.id)
+        .order_by(Finding.page, Finding.id)
+    ):
         output.append(
             dict(
                 id=finding.id,
@@ -530,7 +615,8 @@ def csv_response(rows, name):
         writer.writerow(
             [
                 "'" + str(v)
-                if str(v).startswith(("=", "+", "-", "@", "\t", "\r"))
+                if str(v).lstrip(" \t\r\n").startswith(("=", "+", "-", "@"))
+                or str(v).startswith(("\t", "\r", "\n"))
                 else v
                 for v in row
             ]
@@ -561,7 +647,21 @@ async def import_materials(
     if len(content) > 2 * 1024 * 1024:
         raise HTTPException(413, "CSV limit is 2 MB")
     try:
-        rows = list(csv.DictReader(io.StringIO(content.decode("utf-8-sig"))))
+        reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
+        fields = reader.fieldnames
+        if (
+            not fields
+            or "standard_name" not in fields
+            or len(set(fields)) != len(fields)
+        ):
+            raise ValueError(
+                "CSV requires unique column headers including standard_name"
+            )
+        if set(fields) - set(MaterialIn.model_fields):
+            raise ValueError("CSV contains unsupported columns")
+        rows = list(reader)
+        if not rows:
+            raise ValueError("CSV contains no material records")
         if len(rows) > 5000:
             raise ValueError("Too many rows")
         items = [MaterialIn.model_validate(row) for row in rows]
@@ -571,20 +671,28 @@ async def import_materials(
     except Exception as exc:
         raise HTTPException(422, f"Invalid CSV: {str(exc)[:200]}") from exc
     # Imports are never implicitly trusted, even when their CSV says VERIFIED.
+    imported = 0
+    existing = set(db.scalars(select(Material.standard_name)))
     for item in items:
-        material = db.scalar(
-            select(Material).where(Material.standard_name == item.standard_name)
-        )
-        if material:
+        if item.standard_name in existing:
             continue
         material = Material(
             **{**item.model_dump(), "verification_status": "UNVERIFIED"}
         )
         db.add(material)
-    audit(db, request, "material.import", 0, {"rows": len(items)})
+        imported += 1
+    audit(
+        db,
+        request,
+        "material.import",
+        0,
+        {"rows": len(items), "imported": imported, "skipped": len(items) - imported},
+    )
     db.commit()
     return {
         "rows": len(items),
+        "imported": imported,
+        "skipped": len(items) - imported,
         "message": "Imported records require individual verification",
     }
 
@@ -594,6 +702,9 @@ def create_review(data: ReviewIn, request: Request, db: Session = Depends(get_db
     finding = db.get(Finding, data.finding_id)
     if not finding:
         raise HTTPException(404, "Finding not found")
+    evidence = db.scalar(select(Evidence).where(Evidence.finding_id == finding.id))
+    if not evidence or db.get(Job, evidence.job_id).status != "COMPLETE":
+        raise HTTPException(409, "Review is available only for a completed analysis")
     review = Review(**data.model_dump(), actor=request.state.actor)
     db.add(review)
     audit(db, request, "finding.review", finding.id, data.model_dump())
@@ -612,41 +723,43 @@ def audit_history(limit: int = 100, db: Session = Depends(get_db)):
 
 @app.get("/api/dashboard/stats")
 def dashboard(db: Session = Depends(get_db)):
-    docs = list(db.scalars(select(Document)))
+    statuses = dict(
+        db.execute(
+            select(Document.status, func.count()).group_by(Document.status)
+        ).all()
+    )
+    page_count = db.scalar(select(func.coalesce(func.sum(Document.pages), 0)))
     counts = {"ASBESTOS_CONTAINING": 0, "NON_ASBESTOS": 0, "MANUAL_REVIEW": 0}
     confidence = [0, 0, 0, 0, 0]
     categories = {}
     entries = 0
-    for doc in docs:
-        job = latest_job(db, doc.id)
-        if not job or job.status != "COMPLETE":
-            continue
-        for finding, evidence in db.execute(
-            select(Finding, Evidence)
-            .join(Evidence, Evidence.finding_id == Finding.id)
-            .where(Evidence.job_id == job.id, Evidence.is_material == 1)
-        ):
-            review = db.scalar(
-                select(Review)
-                .where(Review.finding_id == finding.id)
-                .order_by(Review.id.desc())
-            )
-            counts[review.classification if review else finding.classification] += 1
-            confidence[min(4, int(finding.confidence * 5))] += 1
-            category = json.loads(evidence.reference_snapshot).get(
-                "category", "Unmatched"
-            )
-            categories[category] = categories.get(category, 0) + 1
-            entries += 1
+    latest_jobs = select(func.max(Job.id)).group_by(Job.document_id)
+    latest_reviews = select(func.max(Review.id)).group_by(Review.finding_id)
+    for finding, evidence, review in db.execute(
+        select(Finding, Evidence, Review)
+        .join(Evidence, Evidence.finding_id == Finding.id)
+        .join(Job, Job.id == Evidence.job_id)
+        .outerjoin(
+            Review, (Review.finding_id == Finding.id) & Review.id.in_(latest_reviews)
+        )
+        .where(
+            Job.id.in_(latest_jobs), Job.status == "COMPLETE", Evidence.is_material == 1
+        )
+    ):
+        counts[review.classification if review else finding.classification] += 1
+        confidence[min(4, max(0, int(finding.confidence * 5)))] += 1
+        category = json.loads(evidence.reference_snapshot).get("category", "Unmatched")
+        categories[category] = categories.get(category, 0) + 1
+        entries += 1
     return dict(
-        documents=len(docs),
-        pages=sum(d.pages for d in docs),
+        documents=sum(statuses.values()),
+        pages=page_count,
         materials=entries,
         classifications=counts,
         categories=categories,
         confidence=confidence,
         processing={
-            s: sum(d.status == s for d in docs)
+            s: statuses.get(s, 0)
             for s in ("QUEUED", "PROCESSING", "COMPLETE", "FAILED")
         },
     )

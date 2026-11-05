@@ -101,19 +101,49 @@ const blank = {
   description: "",
   manufacturer: "",
 };
-async function api<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch("/api" + path, options);
-  if (!response.ok) {
-    const body = await response
-      .json()
-      .catch(() => ({ detail: response.statusText }));
-    throw Error(
-      typeof body.detail === "string"
-        ? body.detail
-        : JSON.stringify(body.detail),
-    );
+function requestError(status: number, text: string) {
+  let detail: unknown;
+  try {
+    detail = JSON.parse(text).detail;
+  } catch {
+    /* Non-JSON proxy error. */
   }
-  return response.json();
+  if (status === 401)
+    return typeof detail === "string"
+      ? detail
+      : "Session expired. Please sign in again.";
+  if (Array.isArray(detail))
+    return detail
+      .map(
+        (item) =>
+          `${item.loc?.slice(1).join(".") || "Request"}: ${item.msg || "Invalid value"}`,
+      )
+      .join("; ");
+  return typeof detail === "string"
+    ? detail
+    : `Request failed (${status}). Please try again.`;
+}
+async function api<T>(path: string, options?: RequestInit): Promise<T> {
+  const response = await fetch("/api" + path, {
+    ...options,
+    cache: "no-store",
+    signal: options?.signal || AbortSignal.timeout(30000),
+  });
+  if (!response.ok) {
+    if (response.status === 401 && path !== "/session")
+      window.dispatchEvent(new Event("session-expired"));
+    throw Error(requestError(response.status, await response.text()));
+  }
+  return response.status === 204 ? (undefined as T) : response.json();
+}
+async function allDocuments() {
+  const documents: Doc[] = [];
+  for (let offset = 0; ; offset += 200) {
+    const batch = await api<Doc[]>(`/documents?offset=${offset}&limit=200`);
+    documents.push(...batch);
+    if (batch.length < 200)
+      return Array.from(new Map(documents.map((d) => [d.id, d])).values());
+  }
 }
 function Badge({ value }: { value: string }) {
   return (
@@ -122,6 +152,12 @@ function Badge({ value }: { value: string }) {
     </span>
   );
 }
+function isFuzzy(finding: Finding) {
+  return finding.method.toLowerCase().includes("fuzzy");
+}
+function suggestedReference(finding: Finding) {
+  return String(finding.reference.standard_name || finding.normalized_name);
+}
 function pct(value: number) {
   return (value * 100).toFixed(0) + "%";
 }
@@ -129,13 +165,23 @@ function Comparison({ documentId }: { documentId: number }) {
   const [runs, setRuns] = useState<Record<string, Analysis | null>>({}),
     [error, setError] = useState("");
   useEffect(() => {
+    let cancelled = false;
+    setRuns({});
+    setError("");
     api<{ engines: Record<string, Analysis | null> }>("/ocr/compare", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ document_id: documentId }),
     })
-      .then((data) => setRuns(data.engines))
-      .catch((e) => setError(e.message));
+      .then((data) => {
+        if (!cancelled) setRuns(data.engines);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e.message);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [documentId]);
   return (
     <section className="card evidence">
@@ -157,7 +203,7 @@ function Comparison({ documentId }: { documentId: number }) {
                 {runs[engine]!.findings.map((f) => (
                   <div className="comparison-line" key={f.id}>
                     <b>
-                      Page {f.page} · {pct(f.confidence)}
+                      Page {f.page} · Model confidence {pct(f.confidence)}
                     </b>
                     <p>{f.source_text}</p>
                   </div>
@@ -206,6 +252,49 @@ export default function Home() {
   const [loginUsername, setLoginUsername] = useState("reviewer");
   const [loginPassword, setLoginPassword] = useState("");
   const [authRequired, setAuthRequired] = useState(false);
+  const viewVersion = useRef(0);
+  const refreshVersion = useRef(0);
+  const refreshPending = useRef(false);
+  const [loadingAnalysis, setLoadingAnalysis] = useState(false);
+  const [analysisError, setAnalysisError] = useState("");
+  const [documentPage, setDocumentPage] = useState(1);
+  const [catalogSearch, setCatalogSearch] = useState("");
+  const [textView, setTextView] = useState<"materials" | "all">("materials");
+  const [annotationSearch, setAnnotationSearch] = useState("");
+  const clearSession = useCallback(() => {
+    viewVersion.current++;
+    refreshVersion.current++;
+    setAuthenticated(false);
+    setSelected(null);
+    setAnalysis(null);
+    setActive(null);
+    setHistory([]);
+    setDocs([]);
+    setStats(null);
+    setMaterials([]);
+    setRuntime({});
+    setForm(blank);
+    setEditId(null);
+    setReason("");
+    setSource("");
+    setNotice("");
+    setDocumentPage(1);
+    setCatalogSearch("");
+    setAnalysisError("");
+  }, []);
+  useEffect(() => {
+    const expire = () => {
+      clearSession();
+      setError("Session expired. Please sign in again.");
+    };
+    window.addEventListener("session-expired", expire);
+    return () => window.removeEventListener("session-expired", expire);
+  }, [clearSession]);
+  useEffect(() => {
+    setReason("");
+    setSource("");
+    setDecision("MANUAL_REVIEW");
+  }, [active?.id]);
   const canvasRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{
     x: number;
@@ -233,49 +322,82 @@ export default function Home() {
     });
   }, [active, page, zoom]);
   const refresh = useCallback(async () => {
+    if (refreshPending.current) return;
+    refreshPending.current = true;
+    const version = refreshVersion.current;
     try {
       const session = await api<{
         authenticated: boolean;
         authentication_required: boolean;
       }>("/session");
+      if (version !== refreshVersion.current) return;
       setAuthenticated(session.authenticated);
       setAuthRequired(session.authentication_required);
-      if (!session.authenticated) return;
+      if (!session.authenticated) {
+        clearSession();
+        return;
+      }
       const [d, s, m, r] = await Promise.all([
-        api<Doc[]>("/documents"),
+        allDocuments(),
         api<Stats>("/dashboard/stats"),
         api<Material[]>("/materials"),
         api<Record<string, unknown>>("/settings"),
       ]);
+      if (version !== refreshVersion.current) return;
       setDocs(d);
+      setDocumentPage((page) =>
+        Math.min(page, Math.max(1, Math.ceil(d.length / 25))),
+      );
       setStats(s);
       setMaterials(m);
       setRuntime(r);
     } catch (e) {
-      setError((e as Error).message);
+      if (version === refreshVersion.current) setError((e as Error).message);
+    } finally {
+      refreshPending.current = false;
     }
-  }, []);
+  }, [clearSession]);
   useEffect(() => {
     refresh();
     const timer = setInterval(refresh, 5000);
     return () => clearInterval(timer);
   }, [refresh]);
-  const open = useCallback(async (d: Doc, jobId?: number) => {
-    try {
+  const open = useCallback(async (d: Doc, jobId?: number, polling = false) => {
+    const version = polling ? viewVersion.current : ++viewVersion.current;
+    if (!polling) {
+      setTextView("materials");
+      setAnnotationSearch("");
       setSelected(d);
-      const [a, h] = await Promise.all([
-        api<Analysis>(
-          "/documents/" + d.id + "/results" + (jobId ? "?job_id=" + jobId : ""),
-        ),
-        api<Job[]>("/documents/" + d.id + "/history"),
-      ]);
-      setAnalysis(a);
-      setHistory(h);
+      setAnalysis(null);
+      setHistory([]);
       setActive(null);
       setPage(1);
       setZoom(1);
+      setLoadingAnalysis(true);
+      setAnalysisError("");
+    }
+    try {
+      const [a, h, latest] = await Promise.all([
+        api<Analysis>(
+          `/documents/${d.id}/results${jobId ? "?job_id=" + jobId : ""}`,
+        ),
+        api<Job[]>(`/documents/${d.id}/history`),
+        api<Doc>(`/documents/${d.id}`),
+      ]);
+      if (version !== viewVersion.current) return;
+      setAnalysis(a);
+      setHistory(h);
+      setSelected(latest);
+      setAnalysisError("");
+      if (polling)
+        setActive(
+          (previous) => a.findings.find((f) => f.id === previous?.id) || null,
+        );
     } catch (e) {
-      setError((e as Error).message);
+      if (version === viewVersion.current)
+        setAnalysisError((e as Error).message);
+    } finally {
+      if (version === viewVersion.current) setLoadingAnalysis(false);
     }
   }, []);
   useEffect(() => {
@@ -285,8 +407,17 @@ export default function Home() {
       !["QUEUED", "PROCESSING"].includes(analysis.job.status)
     )
       return;
-    const timer = setInterval(() => open(selected, analysis.job.id), 2500);
-    return () => clearInterval(timer);
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      await open(selected, analysis.job.id, true);
+      if (!stopped) timer = setTimeout(poll, 2500);
+    };
+    timer = setTimeout(poll, 2500);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
   }, [selected, analysis, open]);
   async function upload(files: FileList | null) {
     if (!files?.length || busy) return;
@@ -295,6 +426,11 @@ export default function Home() {
     setNotice("");
     try {
       for (const file of Array.from(files)) {
+        const limit = Number(runtime.max_upload_mb || 50);
+        if (file.size > limit * 1024 * 1024)
+          throw Error(
+            `File exceeds the ${limit} MB upload limit: ${file.name}`,
+          );
         const data = new FormData();
         data.append("file", file);
         await new Promise<void>((resolve, reject) => {
@@ -304,9 +440,22 @@ export default function Home() {
             if (e.lengthComputable)
               setProgress(Math.round((e.loaded / e.total) * 100));
           };
-          xhr.onload = () =>
-            xhr.status < 300 ? resolve() : reject(Error(xhr.responseText));
+          xhr.onload = () => {
+            if (xhr.status === 401)
+              window.dispatchEvent(new Event("session-expired"));
+            xhr.status >= 200 && xhr.status < 300
+              ? resolve()
+              : reject(Error(requestError(xhr.status, xhr.responseText)));
+          };
           xhr.onerror = () => reject(Error("Upload connection failed"));
+          xhr.timeout = 120000;
+          xhr.ontimeout = () =>
+            reject(
+              Error(
+                "Upload timed out. Check the drawing list before retrying.",
+              ),
+            );
+          xhr.onabort = () => reject(Error("Upload cancelled"));
           xhr.send(data);
         });
       }
@@ -321,7 +470,8 @@ export default function Home() {
     }
   }
   async function process() {
-    if (!selected) return;
+    if (!selected || busy) return;
+    const version = viewVersion.current;
     setBusy(true);
     setError("");
     try {
@@ -330,7 +480,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ engine, ...config }),
       });
-      await open(d);
+      if (version === viewVersion.current) await open(d);
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -340,7 +490,9 @@ export default function Home() {
   }
   async function saveMaterial(e: React.FormEvent) {
     e.preventDefault();
+    if (busy) return;
     setBusy(true);
+    setError("");
     try {
       await api("/materials" + (editId ? "/" + editId : ""), {
         method: editId ? "PUT" : "POST",
@@ -361,8 +513,10 @@ export default function Home() {
   }
   async function review(e: React.FormEvent) {
     e.preventDefault();
-    if (!active) return;
+    if (!active || busy) return;
+    const version = viewVersion.current;
     setBusy(true);
+    setError("");
     try {
       await api("/reviews", {
         method: "POST",
@@ -374,10 +528,13 @@ export default function Home() {
           source,
         }),
       });
-      setNotice("Review recorded in the audit history.");
-      setReason("");
-      setSource("");
-      if (selected) await open(selected, analysis?.job.id);
+      if (version === viewVersion.current) {
+        setNotice("Review recorded in the audit history.");
+        setReason("");
+        setSource("");
+      }
+      if (selected && version === viewVersion.current)
+        await open(selected, analysis?.job.id, true);
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -395,6 +552,7 @@ export default function Home() {
     ["Settings", Settings],
   ] as const;
   const navigate = (value: string) => {
+    viewVersion.current++;
     setTab(value);
     setSelected(null);
     setAnalysis(null);
@@ -402,7 +560,27 @@ export default function Home() {
     setError("");
     setNotice("");
   };
+  const visibleFindings = (analysis?.findings || []).filter(
+    (f) =>
+      (textView === "all" || f.is_material) &&
+      `${f.source_text} ${f.normalized_name} ${isFuzzy(f) ? suggestedReference(f) : ""}`
+        .toLowerCase()
+        .includes(annotationSearch.trim().toLowerCase()),
+  );
+  const visibleActive =
+    active && visibleFindings.some((f) => f.id === active.id);
   const currentPage = analysis?.pages.find((p) => p.number === page);
+  if (authenticated === null)
+    return (
+      <div className="login-page">
+        <div role="status">
+          Connecting to workspace…{error && <p role="alert">{error}</p>}
+          <button className="button" onClick={refresh}>
+            Retry connection
+          </button>
+        </div>
+      </div>
+    );
   if (authenticated === false)
     return (
       <div className="login-page">
@@ -504,13 +682,17 @@ export default function Home() {
             {authRequired && (
               <button
                 className="button"
+                disabled={busy}
                 onClick={async () => {
-                  await api("/session", { method: "DELETE" });
-                  setSelected(null);
-                  setAnalysis(null);
-                  setDocs([]);
-                  setStats(null);
-                  setAuthenticated(false);
+                  setBusy(true);
+                  try {
+                    await api("/session", { method: "DELETE" });
+                    clearSession();
+                  } catch (e) {
+                    setError((e as Error).message);
+                  } finally {
+                    setBusy(false);
+                  }
                 }}
               >
                 Sign out
@@ -546,7 +728,10 @@ export default function Home() {
                 type="file"
                 multiple
                 accept=".pdf,.png,.jpg,.jpeg"
-                onChange={(e) => upload(e.target.files)}
+                onChange={(e) => {
+                  void upload(e.target.files);
+                  e.target.value = "";
+                }}
               />
             </label>
           </div>
@@ -654,7 +839,7 @@ export default function Home() {
                     ))}
                   </div>
                   <div className="confidence">
-                    <small>OCR CONFIDENCE DISTRIBUTION</small>
+                    <small>OCR MODEL CONFIDENCE DISTRIBUTION</small>
                     <div className="bars">
                       {(stats?.confidence || [0, 0, 0, 0, 0]).map((n, i) => (
                         <div key={i} title={n + " entries"}>
@@ -767,45 +952,71 @@ export default function Home() {
                       </tr>
                     </thead>
                     <tbody>
-                      {docs.map((d) => (
-                        <tr key={d.id}>
-                          <td>
-                            <button
-                              className="file-link"
-                              onClick={() => open(d)}
-                            >
-                              <span className="file-type">
-                                <FileText size={18} />
-                              </span>
-                              <div>
-                                <b>{d.filename}</b>
-                                <small>
-                                  Drawing #{String(d.id).padStart(4, "0")} ·{" "}
-                                  {d.job?.engine}
-                                </small>
-                              </div>
-                            </button>
-                          </td>
-                          <td>{d.pages}</td>
-                          <td>
-                            <Badge value={d.status} />
-                          </td>
-                          <td>
-                            {new Date(d.created_at + "Z").toLocaleDateString()}
-                          </td>
-                          <td>
-                            <button
-                              className="icon-button"
-                              aria-label={"Open " + d.filename}
-                              onClick={() => open(d)}
-                            >
-                              <ArrowUpRight size={18} />
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
+                      {docs
+                        .slice((documentPage - 1) * 25, documentPage * 25)
+                        .map((d) => (
+                          <tr key={d.id}>
+                            <td>
+                              <button
+                                className="file-link"
+                                onClick={() => open(d)}
+                              >
+                                <span className="file-type">
+                                  <FileText size={18} />
+                                </span>
+                                <div>
+                                  <b>{d.filename}</b>
+                                  <small>
+                                    Drawing #{String(d.id).padStart(4, "0")} ·{" "}
+                                    {d.job?.engine}
+                                  </small>
+                                </div>
+                              </button>
+                            </td>
+                            <td>{d.pages}</td>
+                            <td>
+                              <Badge value={d.status} />
+                            </td>
+                            <td>
+                              {new Date(
+                                /(?:Z|[+-]\d{2}:\d{2})$/.test(d.created_at)
+                                  ? d.created_at
+                                  : d.created_at + "Z",
+                              ).toLocaleDateString()}
+                            </td>
+                            <td>
+                              <button
+                                className="icon-button"
+                                aria-label={"Open " + d.filename}
+                                onClick={() => open(d)}
+                              >
+                                <ArrowUpRight size={18} />
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
                     </tbody>
                   </table>
+                </div>
+                <div className="card-title" aria-label="Drawing pagination">
+                  <button
+                    className="button"
+                    disabled={documentPage <= 1}
+                    onClick={() => setDocumentPage((p) => p - 1)}
+                  >
+                    Previous drawings
+                  </button>
+                  <span>
+                    Page {documentPage} /{" "}
+                    {Math.max(1, Math.ceil(docs.length / 25))}
+                  </span>
+                  <button
+                    className="button"
+                    disabled={documentPage * 25 >= docs.length}
+                    onClick={() => setDocumentPage((p) => p + 1)}
+                  >
+                    Next drawings
+                  </button>
                 </div>
                 {!docs.length && (
                   <div className="empty">
@@ -824,6 +1035,7 @@ export default function Home() {
               <button
                 className="back"
                 onClick={() => {
+                  viewVersion.current++;
                   setSelected(null);
                   setAnalysis(null);
                   setActive(null);
@@ -831,6 +1043,18 @@ export default function Home() {
               >
                 <ArrowLeft size={16} /> Back to drawings
               </button>
+              {loadingAnalysis && <p role="status">Loading analysis…</p>}
+              {analysisError && (
+                <div role="alert" className="alert error">
+                  {analysisError}{" "}
+                  <button
+                    className="button"
+                    onClick={() => open(selected, analysis?.job.id)}
+                  >
+                    Retry analysis
+                  </button>
+                </div>
+              )}
               <section className="card analysis-controls">
                 <div>
                   <Badge value={analysis?.job.status || selected.status} />
@@ -870,9 +1094,9 @@ export default function Home() {
                     className="button"
                     disabled={
                       busy ||
-                      ["QUEUED", "PROCESSING"].includes(
-                        analysis?.job.status || "",
-                      )
+                      loadingAnalysis ||
+                      !analysis ||
+                      ["QUEUED", "PROCESSING"].includes(selected.status)
                     }
                     onClick={process}
                   >
@@ -917,7 +1141,8 @@ export default function Home() {
                   </a>
                   <span>
                     {analysis.findings.filter((f) => f.is_material).length}{" "}
-                    materials · {analysis.findings.length} OCR annotations
+                    material findings · {analysis.findings.length} OCR
+                    annotations
                   </span>
                 </div>
               )}
@@ -1008,12 +1233,13 @@ export default function Home() {
                           width={currentPage.width}
                           height={currentPage.height}
                         />
-                        {analysis?.findings
+                        {visibleFindings
                           .filter((f) => f.page === page)
                           .map((f) => (
                             <polygon
                               role="button"
-                              tabIndex={0}
+                              aria-disabled={busy}
+                              tabIndex={busy ? -1 : 0}
                               aria-label={f.source_text}
                               key={f.id}
                               points={f.bbox.map((p) => p.join(",")).join(" ")}
@@ -1023,14 +1249,19 @@ export default function Home() {
                                   : "transparent"
                               }
                               stroke={
-                                colors[
-                                  f.review?.classification || f.classification
-                                ]
+                                f.is_material
+                                  ? colors[
+                                      f.review?.classification ||
+                                        f.classification
+                                    ]
+                                  : "#64748b"
                               }
                               strokeWidth={active?.id === f.id ? 5 : 2}
-                              onClick={() => setActive(f)}
+                              onClick={() => {
+                                if (!busy) setActive(f);
+                              }}
                               onKeyDown={(e) =>
-                                e.key === "Enter" && setActive(f)
+                                !busy && e.key === "Enter" && setActive(f)
                               }
                             />
                           ))}
@@ -1054,66 +1285,145 @@ export default function Home() {
                 </section>
                 <section className="card findings">
                   <div className="card-title">
-                    <h2>Material findings</h2>
-                    <span>
-                      {analysis?.findings.filter((f) => f.is_material).length ||
-                        0}
-                    </span>
+                    <h2>
+                      {textView === "materials"
+                        ? "Material findings"
+                        : "All extracted text"}
+                    </h2>
+                    <span>{visibleFindings.length}</span>
+                  </div>
+                  <div className="annotation-tools">
+                    <div role="group" aria-label="Annotation view">
+                      <button
+                        className="button"
+                        aria-pressed={textView === "materials"}
+                        onClick={() => {
+                          setTextView("materials");
+                          setActive(null);
+                        }}
+                      >
+                        Material findings
+                      </button>
+                      <button
+                        className="button"
+                        aria-pressed={textView === "all"}
+                        onClick={() => {
+                          setTextView("all");
+                          setActive(null);
+                        }}
+                      >
+                        All extracted text
+                      </button>
+                    </div>
+                    <label>
+                      Search extracted text
+                      <input
+                        type="search"
+                        value={annotationSearch}
+                        onChange={(e) => setAnnotationSearch(e.target.value)}
+                      />
+                    </label>
+                    <p>
+                      OCR model confidence is not verified accuracy. Check the
+                      source drawing.
+                    </p>
                   </div>
                   <div className="finding-list">
-                    {analysis?.findings
-                      .filter((f) => f.is_material)
-                      .map((f) => (
-                        <button
-                          key={f.id}
-                          className={
-                            "finding " + (active?.id === f.id ? "chosen" : "")
-                          }
-                          onClick={() => {
-                            setActive(f);
-                            setPage(f.page);
-                          }}
-                        >
+                    {visibleFindings.map((f) => (
+                      <button
+                        key={f.id}
+                        disabled={busy}
+                        className={
+                          "finding " + (active?.id === f.id ? "chosen" : "")
+                        }
+                        onClick={() => {
+                          setActive(f);
+                          setPage(f.page);
+                        }}
+                      >
+                        {f.is_material ? (
                           <Badge
                             value={f.review?.classification || f.classification}
                           />
-                          <h3>{f.normalized_name}</h3>
-                          <p>{f.source_text}</p>
-                          <small>
-                            Page {f.page} · OCR {pct(f.confidence)} · {f.method}{" "}
-                            match {pct(f.match_score)}
-                          </small>
-                        </button>
-                      ))}
-                    {!analysis?.findings.some((f) => f.is_material) && (
+                        ) : (
+                          <span className="badge">Extracted text</span>
+                        )}
+                        <h3>
+                          {isFuzzy(f) || !f.is_material
+                            ? f.source_text
+                            : f.normalized_name}
+                        </h3>
+                        {isFuzzy(f) && (
+                          <p>
+                            Suggested reference: {suggestedReference(f)} · Fuzzy
+                            candidate, not an identified material.
+                          </p>
+                        )}
+                        {!f.is_material && (
+                          <small>Extracted text · No material identified</small>
+                        )}
+                        <p>{f.source_text}</p>
+                        <small>
+                          Page {f.page} · Model confidence {pct(f.confidence)} ·{" "}
+                          {f.is_material &&
+                            `${f.method} similarity ${pct(f.match_score)}`}
+                        </small>
+                      </button>
+                    ))}
+                    {visibleFindings.length === 0 && (
                       <div className="empty">
                         <p>
-                          No material findings yet. Empty results do not
-                          establish asbestos absence.
+                          {annotationSearch.trim()
+                            ? "No extracted text matches your search. Clear the search to see more annotations."
+                            : textView === "materials"
+                              ? "No material findings. Switch to All extracted text to inspect raw OCR rows. This app is designed for engineering drawings; other documents may contain no relevant materials. Empty results do not establish asbestos absence."
+                              : "No extracted text available for this analysis yet."}
                         </p>
                       </div>
                     )}
                   </div>
                 </section>
               </div>
-              {active && (
+              {active && visibleActive && (
                 <section className="card evidence">
                   <div className="card-title">
                     <h2>Finding #{active.id} · Evidence and review</h2>
-                    <Badge value={active.classification} />
+                    {active.is_material ? (
+                      <Badge value={active.classification} />
+                    ) : (
+                      <span className="badge">Extracted text</span>
+                    )}
                   </div>
                   <div className="evidence-grid">
                     <div>
                       <h3>Original AI result</h3>
+                      {isFuzzy(active) && (
+                        <p>
+                          Suggested reference: {suggestedReference(active)} ·
+                          Fuzzy candidate, not an identified material.
+                        </p>
+                      )}
+                      {active.method === "ambiguous" && (
+                        <p>
+                          Conflicting exact references · Material identity
+                          requires review.
+                        </p>
+                      )}
                       <p>{active.explanation}</p>
                       <dl>
                         <dt>Source annotation</dt>
                         <dd>{active.source_text}</dd>
-                        <dt>Engine / confidence</dt>
+                        <dt>
+                          Engine / OCR model confidence (not verified accuracy)
+                        </dt>
                         <dd>
                           {active.engine} / {pct(active.confidence)}
                         </dd>
-                        <dt>Reference snapshot</dt>
+                        <dt>
+                          {isFuzzy(active)
+                            ? "Suggested reference snapshot"
+                            : "Reference snapshot"}
+                        </dt>
                         <dd>
                           <pre>{JSON.stringify(active.reference, null, 2)}</pre>
                         </dd>
@@ -1163,7 +1473,10 @@ export default function Home() {
                           onChange={(e) => setSource(e.target.value)}
                         />
                       </label>
-                      <button disabled={busy} className="button primary">
+                      <button
+                        disabled={busy || analysis?.job.status !== "COMPLETE"}
+                        className="button primary"
+                      >
                         Save review
                       </button>
                     </form>
@@ -1184,55 +1497,83 @@ export default function Home() {
                     Import CSV
                     <input
                       type="file"
+                      disabled={busy}
                       accept=".csv"
                       onChange={async (e) => {
-                        if (!e.target.files?.[0]) return;
+                        if (!e.target.files?.[0] || busy) return;
+                        setBusy(true);
+                        setError("");
                         const data = new FormData();
                         data.append("file", e.target.files[0]);
+                        e.target.value = "";
                         try {
-                          await api("/materials/import", {
+                          const imported = await api<{
+                            imported?: number;
+                            skipped?: number;
+                            rows: number;
+                          }>("/materials/import", {
                             method: "POST",
                             body: data,
                           });
                           setNotice(
-                            "Imported references require individual verification.",
+                            typeof imported.imported === "number" &&
+                              typeof imported.skipped === "number"
+                              ? `Imported ${imported.imported} references; skipped ${imported.skipped} existing references. Imported references require individual verification.`
+                              : `Processed ${imported.rows} CSV rows. Imported references require individual verification.`,
                           );
-                          refresh();
+                          await refresh();
                         } catch (err) {
                           setError((err as Error).message);
+                        } finally {
+                          setBusy(false);
                         }
                       }}
                     />
                   </label>
                   <span>Imported records remain unverified.</span>
                 </div>
-                {materials.map((m) => (
-                  <button
-                    className="catalog-item"
-                    key={m.id}
-                    onClick={() => {
-                      setEditId(m.id);
-                      setForm({
-                        standard_name: m.standard_name,
-                        aliases: m.aliases,
-                        category: m.category,
-                        asbestos_status: m.asbestos_status,
-                        verification_status: m.verification_status,
-                        source: m.source,
-                        conditions: m.conditions,
-                        description: m.description,
-                        manufacturer: m.manufacturer,
-                      });
-                    }}
-                  >
-                    <b>{m.standard_name}</b>
-                    <Badge value={m.verification_status} />
-                    <small>
-                      {m.category} · {m.asbestos_status}
-                    </small>
-                    <p>{m.source}</p>
-                  </button>
-                ))}
+                <label className="catalog-tools">
+                  Search references
+                  <input
+                    type="search"
+                    value={catalogSearch}
+                    onChange={(e) => setCatalogSearch(e.target.value)}
+                  />
+                </label>
+                {materials
+                  .filter((m) =>
+                    `${m.standard_name} ${m.aliases} ${m.manufacturer}`
+                      .toLowerCase()
+                      .includes(catalogSearch.toLowerCase()),
+                  )
+                  .map((m) => (
+                    <button
+                      className="catalog-item"
+                      key={m.id}
+                      disabled={busy}
+                      onClick={() => {
+                        setEditId(m.id);
+                        setForm({
+                          standard_name: m.standard_name,
+                          aliases: m.aliases,
+                          category: m.category,
+                          asbestos_status: m.asbestos_status,
+                          verification_status: m.verification_status,
+                          source: m.source,
+                          conditions: m.conditions,
+                          description: m.description,
+                          manufacturer: m.manufacturer,
+                        });
+                      }}
+                    >
+                      <b>{m.standard_name}</b>
+                      <Badge value={m.verification_status} />
+                      <small>
+                        {m.category} · {m.asbestos_status}
+                      </small>
+                      <p>{m.source}</p>
+                    </button>
+                  ))}
               </section>
               <form className="card material-form" onSubmit={saveMaterial}>
                 <h2>
@@ -1255,6 +1596,13 @@ export default function Home() {
                           key === "source" &&
                           form.verification_status === "VERIFIED"
                         }
+                        maxLength={4000}
+                        minLength={
+                          key === "source" &&
+                          form.verification_status === "VERIFIED"
+                            ? 10
+                            : undefined
+                        }
                         value={form[key as keyof typeof form]}
                         onChange={(e) =>
                           setForm({ ...form, [key]: e.target.value })
@@ -1263,6 +1611,14 @@ export default function Home() {
                     ) : (
                       <input
                         required={key === "standard_name"}
+                        minLength={key === "standard_name" ? 2 : undefined}
+                        maxLength={
+                          key === "category"
+                            ? 100
+                            : ["standard_name", "manufacturer"].includes(key)
+                              ? 255
+                              : 4000
+                        }
                         value={form[key as keyof typeof form]}
                         onChange={(e) =>
                           setForm({ ...form, [key]: e.target.value })

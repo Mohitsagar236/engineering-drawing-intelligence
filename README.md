@@ -56,7 +56,11 @@ The release targets one authenticated workspace with one dispatcher. Signed brow
 
 ## Quick start
 
-Requires **Python 3.11** and **Node.js 22**.
+Requires **Python 3.11** and **Node.js 22**. For a supervised, isolated local stack,
+run `python3.11 scripts/local.py setup --provision-models` followed by
+`python3.11 scripts/local.py run` from the repository root. See the
+[local deployment instructions](docs/DEPLOYMENT.md#local-development) for alternate
+ports and workstation runtime paths.
 
 ### 1. Backend
 
@@ -65,7 +69,8 @@ git clone https://github.com/Mohitsagar236/engineering-drawing-intelligence.git
 cd engineering-drawing-intelligence/backend
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-dev.txt -r requirements-easyocr.txt
+pip install --require-hashes -r requirements.lock
+pip install -c requirements.lock -r requirements-dev.txt -r requirements-easyocr.txt
 cp .env.example .env
 alembic upgrade head
 PYTHONPATH=. python scripts/provision_models.py --engine easyocr
@@ -99,7 +104,7 @@ Uploads stay queued until the worker is running. OCR weights download during pro
 ```bash
 cd backend
 source .venv/bin/activate
-pip install -r requirements-ocr.txt
+pip install -c requirements.lock -r requirements-ocr.txt
 PYTHONPATH=. python scripts/provision_models.py --engine paddleocr
 ```
 
@@ -113,7 +118,7 @@ docker compose up --build -d
 docker compose run --rm backend python scripts/provision_models.py --engine easyocr
 ```
 
-Compose builds the production frontend, migrates the database, starts the API and worker, and persists uploads, pages, and model weights. The frontend binds to localhost:3000. Enable PaddleOCR with `INSTALL_PADDLE=true` when building. Public deployment requires HTTPS and production authentication settings; see [DEPLOYMENT.md](docs/DEPLOYMENT.md).
+Compose builds the production frontend, migrates the database, starts the API and worker, and persists uploads, pages, and model weights. The frontend binds to localhost:3000. Enable PaddleOCR with `INSTALL_PADDLE=true` when building. Public deployment requires HTTPS and the mandatory-secret `docker-compose.production.yml` override; see [DEPLOYMENT.md](docs/DEPLOYMENT.md#private-deployment).
 
 ## API examples
 

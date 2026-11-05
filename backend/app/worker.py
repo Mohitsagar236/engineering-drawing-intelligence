@@ -2,10 +2,12 @@
 
 import logging
 import fcntl
+import os
 import signal
 import subprocess
 import sys
 import time
+import threading
 from datetime import datetime
 from pathlib import Path
 from sqlalchemy import select, update
@@ -20,11 +22,63 @@ logger = logging.getLogger(__name__)
 def fail(job_id, message):
     with SessionLocal() as db:
         job = db.get(Job, job_id)
-        if job.status == "FAILED" and job.error:
+        if not job or job.status in ("COMPLETE", "FAILED"):
             return
         job.status, job.error, job.completed_at = "FAILED", message, datetime.utcnow()
         db.get(Document, job.document_id).status = "FAILED"
         db.commit()
+
+
+def heartbeat():
+    (Path(settings.upload_dir) / ".worker-heartbeat").touch()
+
+
+def execute_job(job_id):
+    """Keep readiness current and always reap inference on timeout or shutdown."""
+    child = subprocess.Popen(
+        [sys.executable, "-m", "app.worker", "--job", str(job_id)],
+        start_new_session=True,
+        env={**os.environ, "ED_DISPATCHER_PID": str(os.getpid())},
+    )
+    deadline = time.monotonic() + settings.processing_timeout
+    timed_out = False
+    try:
+        while True:
+            heartbeat()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                return
+            try:
+                code = child.wait(timeout=min(1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+            if code:
+                fail(
+                    job_id,
+                    "OCR process failed. Check worker logs and installed models, then retry.",
+                )
+            return
+    finally:
+        if child.poll() is None:
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+            fail(
+                job_id,
+                "Processing exceeded configured timeout; retry with fewer pages."
+                if timed_out
+                else "Worker stopped during processing; retry analysis.",
+            )
 
 
 def run():
@@ -41,6 +95,7 @@ def run():
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
     # Run one dispatcher per database. Interrupted jobs retain partial evidence and can be retried.
     with SessionLocal() as db:
         for job in db.scalars(select(Job).where(Job.status == "PROCESSING")):
@@ -48,9 +103,11 @@ def run():
                 "FAILED",
                 "Worker restarted during processing; retry analysis.",
             )
+            job.completed_at = datetime.utcnow()
             db.get(Document, job.document_id).status = "FAILED"
         db.commit()
     while True:
+        heartbeat()
         with SessionLocal() as db:
             job = db.scalar(select(Job).where(Job.status == "QUEUED").order_by(Job.id))
             if job is None:
@@ -70,32 +127,41 @@ def run():
             time.sleep(1)
             continue
         try:
-            outcome = subprocess.run(
-                [sys.executable, "-m", "app.worker", "--job", str(job_id)],
-                timeout=settings.processing_timeout,
-                check=False,
-            )
-            if outcome.returncode:
-                fail(
-                    job_id,
-                    "OCR process failed. Check worker logs and installed models, then retry.",
-                )
-        except subprocess.TimeoutExpired:
+            execute_job(job_id)
+        except Exception:
+            logger.exception("Could not execute analysis %s", job_id)
             fail(
                 job_id,
-                "Processing exceeded configured timeout; retry with fewer pages.",
+                "Worker could not execute analysis. Check worker logs, then retry.",
             )
+
+
+def watch_dispatcher(parent_pid):
+    # SIGKILL cannot run the dispatcher's finally block. Stop orphaned inference
+    # when its owning dispatcher disappears, including outside Docker.
+    while os.getppid() == parent_pid:
+        time.sleep(1)
+    os._exit(1)
 
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--job":
+        if os.environ.get("ED_DISPATCHER_PID"):
+            threading.Thread(
+                target=watch_dispatcher,
+                args=(int(os.environ["ED_DISPATCHER_PID"]),),
+                daemon=True,
+            ).start()
         try:
             from app.services.processing import process
 
             process(int(sys.argv[2]))
-        except Exception as exc:
+        except Exception:
             logger.exception("Analysis failed")
-            fail(int(sys.argv[2]), f"{type(exc).__name__}: {str(exc)[:500]}")
+            fail(
+                int(sys.argv[2]),
+                "OCR analysis failed. Check worker logs and installed models, then retry.",
+            )
             sys.exit(1)
     else:
         run()
