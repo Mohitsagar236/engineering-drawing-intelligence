@@ -1054,3 +1054,197 @@ footer {
 .finding p {
   overflow-wrap: anywhere;
 }
+
+/* Projects, filters, batch actions, extraction and audit log */
+.filter-bar,
+.batch-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  padding: 14px 20px;
+}
+.filter-bar input[type="search"] {
+  flex: 1 1 240px;
+}
+.filter-bar input,
+.filter-bar select,
+.batch-bar select,
+.doc-meta select,
+.doc-meta input,
+.project-form input,
+.project-summary select {
+  border: 1px solid #d7dee9;
+  border-radius: 8px;
+  padding: 9px 11px;
+  background: #fff;
+  color: inherit;
+}
+.batch-bar {
+  background: #eef3fd;
+  border-bottom: 1px solid #d7e2f7;
+}
+.doc-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  align-items: center;
+  padding: 14px 20px;
+  margin-bottom: 16px;
+}
+.doc-meta label {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.tag-editor {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.tag {
+  border: 0;
+  border-radius: 999px;
+  padding: 4px 10px;
+  background: #e5ecfb;
+  color: #1e4bb3;
+}
+.tags-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.tags-inline .tag {
+  padding: 1px 8px;
+  font-size: 11px;
+}
+button.link {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: #285fd8;
+  text-decoration: underline;
+  text-align: left;
+}
+.error-text {
+  color: #b3333c;
+}
+.project-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: end;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+}
+.project-form .card-title {
+  width: 100%;
+}
+.project-form label {
+  display: grid;
+  gap: 4px;
+}
+.project-summary,
+.extraction,
+.audit {
+  padding-bottom: 18px;
+  margin-bottom: 16px;
+}
+.project-summary > *:not(.card-title),
+.extraction > *:not(.card-title),
+.audit > p {
+  margin-left: 20px;
+  margin-right: 20px;
+}
+.metrics.compact {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 12px;
+}
+.metrics.compact .metric {
+  border: 1px solid #e3e9f2;
+  border-radius: 10px;
+  padding: 12px;
+}
+.metrics.compact .metric b {
+  display: block;
+  font-size: 24px;
+}
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 22px;
+}
+.bars > div {
+  display: grid;
+  grid-template-columns: 120px 1fr 36px;
+  gap: 8px;
+  align-items: center;
+  margin: 6px 0;
+}
+.bars i {
+  height: 10px;
+  border-radius: 5px;
+  background: #e9eef6;
+  overflow: hidden;
+}
+.bars b {
+  display: block;
+  height: 100%;
+}
+.bars em {
+  font-style: normal;
+  text-align: right;
+}
+.title-block {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+}
+.title-block div {
+  border: 1px solid #e3e9f2;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.title-block dt {
+  font-size: 11px;
+  color: #6b7a90;
+  text-transform: uppercase;
+}
+.title-block dd {
+  margin: 2px 0 0;
+  font-weight: 600;
+}
+.dimension-list {
+  max-height: 260px;
+  overflow: auto;
+}
+.audit pre {
+  margin: 6px 0 0;
+  max-width: 420px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #f5f7fa;
+  padding: 8px;
+  border-radius: 6px;
+}
+.filter-bar select,
+.batch-bar select,
+.doc-meta select,
+.doc-meta input,
+.project-summary select {
+  width: auto;
+  flex: 0 0 auto;
+}
+.doc-meta input {
+  max-width: 160px;
+}
+td input[type="checkbox"],
+th input[type="checkbox"] {
+  width: auto;
+}
+.extraction .card-note {
+  text-align: left;
+}

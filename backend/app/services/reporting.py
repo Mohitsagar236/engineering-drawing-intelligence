@@ -17,6 +17,52 @@ def wrap_line(text, max_width=523):
     yield line
 
 
+def render_lines(lines, footer):
+    with fitz.open() as pdf:
+        page = None
+        y = 0
+        for line in lines:
+            for wrapped in wrap_line(line):
+                if page is None or y > 785:
+                    page = pdf.new_page(width=595, height=842)
+                    y = 42
+                page.insert_text((36, y), wrapped, fontname="japan", fontsize=10)
+                y += 15
+        for number, report_page in enumerate(pdf, 1):
+            report_page.insert_text(
+                (36, 820),
+                f"{footer} | Page {number} of {len(pdf)}",
+                fontname="helv",
+                fontsize=8,
+            )
+        return pdf.tobytes(garbage=4, deflate=True)
+
+
+def project_pdf(project, summary):
+    lines = [
+        "ENGINEERING DRAWING INTELLIGENCE - PROJECT SUMMARY",
+        f"Project: {project.name}",
+        f"Description: {project.description or '-'}",
+        f"Documents: {summary['documents']} | Pages: {summary['pages']}",
+        f"Processing: {json.dumps(summary['processing'])}",
+        f"Material annotations: {summary['materials']}",
+        f"Classifications: {json.dumps(summary['classifications'])}",
+        f"Categories: {json.dumps(summary['categories'], ensure_ascii=False)}",
+        "Decision support only. Professional surveying and source verification are required.",
+        "",
+    ]
+    for item in summary["items"]:
+        c = item["classifications"]
+        lines.append(
+            f"#{item['id']} {item['filename']} [{item['status']}] "
+            f"asbestos {c['ASBESTOS_CONTAINING']} / non-asbestos {c['NON_ASBESTOS']} "
+            f"/ manual review {c['MANUAL_REVIEW']}"
+        )
+    if not summary["items"]:
+        lines.append("No documents in this project.")
+    return render_lines(lines, f"Project {project.id}")
+
+
 def pdf_report(document, result):
     lines = [
         "ENGINEERING DRAWING INTELLIGENCE",

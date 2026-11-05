@@ -134,7 +134,8 @@ def test_document_pagination_uses_bounded_queries(client, db):
     second = client.get("/api/documents?limit=200&offset=200").json()
     assert len(first) == 200 and len(second) == 5
     assert set(d["id"] for d in first).isdisjoint(d["id"] for d in second)
-    assert len(statements) == 1
+    # Count, page of documents, and one batched tag load: independent of page size.
+    assert len(statements) == 3
 
 
 def test_worker_reaps_inference_on_shutdown(monkeypatch, tmp_path):

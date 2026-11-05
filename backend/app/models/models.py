@@ -1,9 +1,45 @@
 from __future__ import annotations
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Table,
+    Text,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.session import Base
+
+
+document_tags = Table(
+    "document_tags",
+    Base.metadata,
+    Column(
+        "document_id",
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("tag_id", ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True),
+)
+
+
+class Project(Base):
+    __tablename__ = "projects"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    description: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Tag(Base):
+    __tablename__ = "tags"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(40), unique=True)
 
 
 class Document(Base):
@@ -14,6 +50,10 @@ class Document(Base):
     pages: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(40), default="QUEUED", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    project_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    tags: Mapped[list[Tag]] = relationship(secondary=document_tags, lazy="selectin")
     findings: Mapped[list[Finding]] = relationship(
         back_populates="document", cascade="all, delete-orphan"
     )
@@ -100,7 +140,7 @@ class Audit(Base):
     __tablename__ = "audit_history"
     id: Mapped[int] = mapped_column(primary_key=True)
     actor: Mapped[str] = mapped_column(String(100))
-    action: Mapped[str] = mapped_column(String(80))
+    action: Mapped[str] = mapped_column(String(80), index=True)
     entity_id: Mapped[int] = mapped_column(Integer)
     payload: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

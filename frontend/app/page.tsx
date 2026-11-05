@@ -8,7 +8,9 @@ import {
   ChevronRight,
   Database,
   FileText,
+  FolderKanban,
   FolderOpen,
+  History,
   LayoutDashboard,
   ScanLine,
   Settings,
@@ -17,6 +19,18 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
+import { api, requestError } from "./api";
+import {
+  AuditView,
+  BatchBar,
+  DocumentMeta,
+  ExtractionPanel,
+  FilterBar,
+  ProjectsView,
+  useCatalog,
+  useFilteredDocs,
+  type Filters,
+} from "./workspace";
 type Job = {
   id: number;
   status: string;
@@ -30,6 +44,8 @@ type Doc = {
   pages: number;
   status: string;
   created_at: string;
+  project_id: number | null;
+  tags: string[];
   job: Job | null;
 };
 type Review = {
@@ -101,41 +117,6 @@ const blank = {
   description: "",
   manufacturer: "",
 };
-function requestError(status: number, text: string) {
-  let detail: unknown;
-  try {
-    detail = JSON.parse(text).detail;
-  } catch {
-    /* Non-JSON proxy error. */
-  }
-  if (status === 401)
-    return typeof detail === "string"
-      ? detail
-      : "Session expired. Please sign in again.";
-  if (Array.isArray(detail))
-    return detail
-      .map(
-        (item) =>
-          `${item.loc?.slice(1).join(".") || "Request"}: ${item.msg || "Invalid value"}`,
-      )
-      .join("; ");
-  return typeof detail === "string"
-    ? detail
-    : `Request failed (${status}). Please try again.`;
-}
-async function api<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch("/api" + path, {
-    ...options,
-    cache: "no-store",
-    signal: options?.signal || AbortSignal.timeout(30000),
-  });
-  if (!response.ok) {
-    if (response.status === 401 && path !== "/session")
-      window.dispatchEvent(new Event("session-expired"));
-    throw Error(requestError(response.status, await response.text()));
-  }
-  return response.status === 204 ? (undefined as T) : response.json();
-}
 async function allDocuments() {
   const documents: Doc[] = [];
   for (let offset = 0; ; offset += 200) {
@@ -261,6 +242,15 @@ export default function Home() {
   const [catalogSearch, setCatalogSearch] = useState("");
   const [textView, setTextView] = useState<"materials" | "all">("materials");
   const [annotationSearch, setAnnotationSearch] = useState("");
+  const [filters, setFilters] = useState<Filters>({
+    q: "",
+    status: "",
+    project: "",
+    tag: "",
+  });
+  const [checked, setChecked] = useState<number[]>([]);
+  const catalog = useCatalog(docs);
+  const shownDocs = useFilteredDocs(docs, filters);
   const clearSession = useCallback(() => {
     viewVersion.current++;
     refreshVersion.current++;
@@ -548,7 +538,9 @@ export default function Home() {
     ["OCR comparison", ScanLine],
     ["Material database", Database],
     ["Manual review", ShieldCheck],
+    ["Projects", FolderKanban],
     ["Reports", FileText],
+    ["Audit log", History],
     ["Settings", Settings],
   ] as const;
   const navigate = (value: string) => {
@@ -938,12 +930,59 @@ export default function Home() {
                           ? "Select a drawing to compare OCR engines"
                           : "Drawing workspace"}
                   </h2>
-                  <span>{docs.length} drawings</span>
+                  <span>{shownDocs.length} drawings</span>
                 </div>
+                <FilterBar
+                  filters={filters}
+                  onChange={(f) => {
+                    setFilters(f);
+                    setDocumentPage(1);
+                  }}
+                  projects={catalog.projects}
+                  tags={catalog.tags}
+                  shown={shownDocs.length}
+                />
+                <BatchBar
+                  ids={checked}
+                  onClear={() => setChecked([])}
+                  projects={catalog.projects}
+                  onChanged={() => {
+                    catalog.reload();
+                    refresh();
+                  }}
+                />
                 <div className="table-scroll">
                   <table>
                     <thead>
                       <tr>
+                        <th>
+                          <input
+                            type="checkbox"
+                            aria-label="Select all drawings on this page"
+                            checked={
+                              !!shownDocs.length &&
+                              shownDocs
+                                .slice(
+                                  (documentPage - 1) * 25,
+                                  documentPage * 25,
+                                )
+                                .every((d) => checked.includes(d.id))
+                            }
+                            onChange={(e) => {
+                              const ids = shownDocs
+                                .slice(
+                                  (documentPage - 1) * 25,
+                                  documentPage * 25,
+                                )
+                                .map((d) => d.id);
+                              setChecked((c) =>
+                                e.target.checked
+                                  ? Array.from(new Set([...c, ...ids]))
+                                  : c.filter((id) => !ids.includes(id)),
+                              );
+                            }}
+                          />
+                        </th>
                         <th>DRAWING</th>
                         <th>PAGES</th>
                         <th>STATUS</th>
@@ -952,10 +991,24 @@ export default function Home() {
                       </tr>
                     </thead>
                     <tbody>
-                      {docs
+                      {shownDocs
                         .slice((documentPage - 1) * 25, documentPage * 25)
                         .map((d) => (
                           <tr key={d.id}>
+                            <td>
+                              <input
+                                type="checkbox"
+                                aria-label={"Select " + d.filename}
+                                checked={checked.includes(d.id)}
+                                onChange={(e) =>
+                                  setChecked((c) =>
+                                    e.target.checked
+                                      ? [...c, d.id]
+                                      : c.filter((id) => id !== d.id),
+                                  )
+                                }
+                              />
+                            </td>
                             <td>
                               <button
                                 className="file-link"
@@ -970,6 +1023,15 @@ export default function Home() {
                                     Drawing #{String(d.id).padStart(4, "0")} ·{" "}
                                     {d.job?.engine}
                                   </small>
+                                  {(d.tags?.length ?? 0) > 0 && (
+                                    <span className="tags-inline">
+                                      {(d.tags ?? []).map((t) => (
+                                        <span className="tag" key={t}>
+                                          {t}
+                                        </span>
+                                      ))}
+                                    </span>
+                                  )}
                                 </div>
                               </button>
                             </td>
@@ -1008,17 +1070,17 @@ export default function Home() {
                   </button>
                   <span>
                     Page {documentPage} /{" "}
-                    {Math.max(1, Math.ceil(docs.length / 25))}
+                    {Math.max(1, Math.ceil(shownDocs.length / 25))}
                   </span>
                   <button
                     className="button"
-                    disabled={documentPage * 25 >= docs.length}
+                    disabled={documentPage * 25 >= shownDocs.length}
                     onClick={() => setDocumentPage((p) => p + 1)}
                   >
                     Next drawings
                   </button>
                 </div>
-                {!docs.length && (
+                {!shownDocs.length && (
                   <div className="empty">
                     <FolderOpen size={32} />
                     <h3>Your drawing workspace starts here.</h3>
@@ -1483,8 +1545,46 @@ export default function Home() {
                   </div>
                 </section>
               )}
+              <DocumentMeta
+                doc={docs.find((d) => d.id === selected.id) || selected}
+                projects={catalog.projects}
+                onChanged={() => {
+                  catalog.reload();
+                  refresh();
+                }}
+              />
+              {analysis?.job.status === "COMPLETE" && (
+                <ExtractionPanel
+                  documentId={selected.id}
+                  jobId={analysis.job.id}
+                  onSelect={(id) => {
+                    const found = analysis.findings.find((f) => f.id === id);
+                    if (found) {
+                      setTextView("all");
+                      setAnnotationSearch("");
+                      setPage(found.page);
+                      setActive(found);
+                      window.scrollTo({ top: 0, behavior: "smooth" });
+                    }
+                  }}
+                />
+              )}
             </>
           )}
+          {!selected && tab === "Projects" && (
+            <ProjectsView
+              projects={catalog.projects}
+              reload={() => {
+                catalog.reload();
+                refresh();
+              }}
+              onOpen={(id) => {
+                const doc = docs.find((d) => d.id === id);
+                if (doc) open(doc);
+              }}
+            />
+          )}
+          {!selected && tab === "Audit log" && <AuditView />}
           {!selected && tab === "Material database" && (
             <div className="catalog-grid">
               <section className="card">

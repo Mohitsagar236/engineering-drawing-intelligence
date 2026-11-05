@@ -1,5 +1,5 @@
-from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from typing import Literal, Optional
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Classification = Literal["ASBESTOS_CONTAINING", "NON_ASBESTOS", "MANUAL_REVIEW"]
 
@@ -64,3 +64,29 @@ class CompareIn(BaseModel):
 class LoginIn(BaseModel):
     username: str = Field(max_length=100)
     password: str = Field(max_length=1000)
+
+
+class ProjectIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: str = Field(min_length=2, max_length=120)
+    description: str = Field(default="", max_length=2000)
+
+
+class DocumentUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    project_id: Optional[int] = Field(default=None, gt=0)
+    tags: Optional[list[str]] = Field(default=None, max_length=20)
+
+    @field_validator("tags")
+    @classmethod
+    def valid_tags(cls, tags):
+        if tags is None:
+            return tags
+        cleaned = []
+        for tag in tags:
+            tag = " ".join(tag.lower().split())
+            if not 1 <= len(tag) <= 40:
+                raise ValueError("Tags must be 1 to 40 characters")
+            if tag not in cleaned:
+                cleaned.append(tag)
+        return cleaned

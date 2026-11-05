@@ -17,6 +17,10 @@ A working application for OCR, material reference matching, and asbestos review.
 - **Manage references:** create, edit, verify, and import/export material catalog records, including manufacturer, conditions, source, and update date.
 - **Review findings:** save a reason and evidence source for each human decision while preserving the original AI result.
 - **Export reports:** downloadable PDF and CSV reports, including historical analysis runs.
+- **Organize and search:** group drawings into projects, add tags, and filter by file name, tag, status, project, or recognized OCR text.
+- **Extract drawing data:** heuristic title block fields, dimensions (diameter, radius, thread, angle, tolerance), and bill-of-materials tables, each linked to its source annotation and exportable to CSV.
+- **Report in bulk:** project summary PDFs with classification, category, and confidence charts; combined CSV and ZIP-of-PDF exports for any selection of up to 50 drawings.
+- **Audit everything:** a filterable, paginated audit log viewer covering uploads, reprocessing, reviews, catalog changes, and project edits.
 - **Monitor processing:** database-backed dashboard counts, classification distribution, OCR confidence, status, failures, and processing history.
 
 ![Drawing viewer with source annotations and review workflow](docs/images/drawing-viewer.png)

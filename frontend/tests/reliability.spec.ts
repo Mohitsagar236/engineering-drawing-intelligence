@@ -6,6 +6,8 @@ const drawing = (id: number, status = "COMPLETE") => ({
   pages: 2,
   status,
   created_at: "2026-11-05T10:00:00Z",
+  project_id: null,
+  tags: [],
   job: { id, status, engine: "easyocr", error: "", preprocessing: {} },
 });
 const result = (id: number, status = "COMPLETE") => ({
@@ -58,7 +60,8 @@ async function mock(page: Page, count = 2, status = "COMPLETE") {
         confidence: [],
         processing: {},
       };
-    else if (path === "/materials") body = [];
+    else if (path === "/materials" || path === "/projects" || path === "/tags")
+      body = [];
     else if (/\/history$/.test(path))
       body = [drawing(Number(path.split("/")[2]), status).job];
     else if (/\/results$/.test(path))
